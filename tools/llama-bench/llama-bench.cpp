@@ -1010,6 +1010,59 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     params.tensor_buft_overrides.push_back(group_tensor_buft_overrides);
                     override_group_span_len = std::strcspn(value, ",");
                 } while (!last_group);
+            } else if (arg == "-vsplit" || arg == "--vvm-split") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto * value = argv[i];
+                /* static */ std::map<std::string, ggml_backend_buffer_type_t> vvm_buft_list;
+                if (vvm_buft_list.empty()) {
+                    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                        auto * dev = ggml_backend_dev_get(i);
+                        auto * buft = ggml_backend_dev_buffer_type(dev);
+                        if (buft) {
+                            vvm_buft_list[ggml_backend_buft_name(buft)] = buft;
+                        }
+                    }
+                }
+                // VVM split: pattern=target[;pattern=target...] where target is
+                // a buffer type name or "auto" (free-VRAM-weighted placement).
+                std::vector<llama_model_tensor_buft_override> vvm_overrides{};
+                auto vvm_span_len = std::strcspn(value, ";");
+                while (vvm_span_len > 0) {
+                    auto * override = value;
+                    if (value[vvm_span_len] != '\0') {
+                        value[vvm_span_len] = '\0';
+                        value = &value[vvm_span_len + 1];
+                    } else {
+                        value = &value[vvm_span_len];
+                    }
+                    auto tensor_name_span_len = std::strcspn(override, "=");
+                    if (tensor_name_span_len >= vvm_span_len) {
+                        invalid_param = true;
+                        break;
+                    }
+                    override[tensor_name_span_len] = '\0';
+                    auto * tensor_name = override;
+                    auto * target = &override[tensor_name_span_len + 1];
+                    if (strcmp(target, "auto") == 0) {
+                        vvm_overrides.push_back({tensor_name, nullptr});
+                    } else {
+                        if (vvm_buft_list.find(target) == vvm_buft_list.end()) {
+                            printf("error: unrecognized VVM split target '%s' (use a buffer type name or 'auto')\n", target);
+                            invalid_param = true;
+                            break;
+                        }
+                        vvm_overrides.push_back({tensor_name, vvm_buft_list.at(target)});
+                    }
+                    vvm_span_len = std::strcspn(value, ";");
+                }
+                if (invalid_param) {
+                    break;
+                }
+                vvm_overrides.push_back({nullptr,nullptr});
+                params.tensor_buft_overrides.push_back(vvm_overrides);
             } else if (arg == "-r" || arg == "--repetitions") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1643,7 +1696,10 @@ struct test {
                 } else {
                     tensor_buft_overrides_str += tensor_buft_overrides[i].pattern;
                     tensor_buft_overrides_str += "=";
-                    tensor_buft_overrides_str += ggml_backend_buft_name(tensor_buft_overrides[i].buft);
+                    // VVM auto entries carry a null buft (resolved at load time)
+                    tensor_buft_overrides_str += tensor_buft_overrides[i].buft
+                        ? ggml_backend_buft_name(tensor_buft_overrides[i].buft)
+                        : "auto";
                 }
                 if (i + 2 < tensor_buft_overrides.size()) {
                     tensor_buft_overrides_str += ";";

@@ -24,6 +24,19 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type(voi
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_vk_reg(void);
 
+// VVM (Chonk Buffer) integration - active when built with GGML_VK_VVM_POOL
+// and runtime env GGML_VK_VVM_POOL=1; otherwise stats returns "[]" and
+// auto-pick returns NULL.
+// Snapshot per-device free-VRAM budgets before a model load, then call
+// ggml_vulkan_vvm_auto_pick() per tensor to distribute weights across
+// Vulkan devices proportionally to their remaining budget.
+GGML_BACKEND_API void ggml_vulkan_vvm_auto_begin(void);
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_vulkan_vvm_auto_pick(size_t nbytes);
+// Returns a JSON array of live Chonk Buffer pools: device, block size, block
+// count, allocations, used/free/capacity bytes, fragmentation. The returned
+// pointer is valid until the next call.
+GGML_BACKEND_API const char * ggml_vulkan_vvm_stats_json(void);
+
 #ifdef  __cplusplus
 }
 #endif

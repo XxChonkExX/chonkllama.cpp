@@ -1,6 +1,7 @@
 #include "llama-model-loader.h"
 
 #include "ggml-alloc.h"
+#include "ggml-vulkan.h"
 #include "ggml.h"
 #include "gguf.h"
 #include "llama-hparams.h"
@@ -555,6 +556,18 @@ llama_model_loader::llama_model_loader(
     }
 
     tensor_buft_overrides = param_tensor_buft_overrides_p;
+
+    // VVM auto placement: snapshot per-device free-VRAM budgets once, before
+    // any tensor buffer is allocated, so 'auto' overrides distribute weights
+    // proportionally to what each Vulkan GPU actually has free.
+    if (tensor_buft_overrides) {
+        for (const auto * p = tensor_buft_overrides; p->pattern != nullptr; ++p) {
+            if (p->buft == nullptr) {
+                ggml_vulkan_vvm_auto_begin();
+                break;
+            }
+        }
+    }
 
     this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
     this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
@@ -1230,7 +1243,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
                 std::regex pattern(overrides->pattern);
                 if (std::regex_search(tensor_name, pattern)) {
-                    if (overrides->buft == ggml_backend_cpu_buffer_type()) {
+                    if (overrides->buft == nullptr) {
+                        // VVM auto placement: pick the Vulkan device with the
+                        // most remaining free-VRAM budget for this tensor.
+                        buft = ggml_vulkan_vvm_auto_pick(ggml_nbytes(t_meta));
+                        if (buft == nullptr) {
+                            // VVM unavailable - fall through to default placement.
+                            break;
+                        }
+                    } else if (overrides->buft == ggml_backend_cpu_buffer_type()) {
                         // when overriding to a CPU buffer, consider the extra buffer types
                         buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
                         if (use_mmap) {

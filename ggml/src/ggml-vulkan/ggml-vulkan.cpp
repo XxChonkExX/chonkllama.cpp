@@ -1305,12 +1305,21 @@ struct vk_buffer_struct {
 
     vk_device device;
 
+    // VVM (Chonk Buffer) integration: when true, this buffer's memory is owned
+    // by an external vvm::UnifiedMemoryPool sub-allocation. The raw Vulkan
+    // objects must NOT be destroyed here - ownership returns to the pool via
+    // the shared_ptr deleter installed at creation time.
+    bool external_memory = false;
+
     ~vk_buffer_struct() {
         if (size == 0) {
             return;
         }
         VK_LOG_DEBUG("~vk_buffer_struct(" << buffer << ", " << size << ")");
 
+        if (external_memory) {
+            return;
+        }
         device->device.freeMemory(device_memory);
         device->device.destroyBuffer(buffer);
     }
@@ -3819,6 +3828,320 @@ static vk_buffer ggml_vk_create_buffer_check(vk_device& device, size_t size, vk:
         throw e;
     }
 }
+
+// ============================ VVM (Chonk Buffer) integration ============================
+#if defined(GGML_VK_VVM_POOL)
+
+static vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size);
+
+#include "vulkan_vm/vulkan_vm.hpp"
+
+#include <cstdlib>
+#include <mutex>
+#include <unordered_map>
+
+// Chonk Buffer pooling: route ggml tensor buffer allocations through a
+// vvm::UnifiedMemoryPool instead of per-buffer vkAllocateMemory. Enabled by
+// defining GGML_VK_VVM_POOL at build time and setting GGML_VK_VVM_POOL=1 at
+// runtime. Pools are created lazily per VkDevice and intentionally live until
+// process exit (buffer lifetimes may outlast backend teardown ordering).
+
+// File-scope pool registry so the stats/auto-placement API can iterate pools.
+struct vvm_pool_entry {
+    std::unique_ptr<vvm::UnifiedMemoryPool> pool;
+    vk_device device;                 // owning ggml-vulkan device
+    std::string name;                 // e.g. "Vulkan0"
+};
+static std::mutex g_vvm_pools_mtx;
+static std::unordered_map<void *, vvm_pool_entry> g_vvm_pools;   // key = VkDevice
+
+// Auto-split placement state (--vvm-split pattern=auto): per-device remaining
+// byte budgets, snapshotted from free VRAM at load start and consumed as
+// tensors are assigned.
+struct vvm_auto_budget {
+    ggml_backend_buffer_type_t buft = nullptr;
+    std::string name;
+    uint64_t remaining = 0;
+};
+static std::vector<vvm_auto_budget> g_vvm_auto_budgets;
+static bool g_vvm_auto_started = false;
+
+static bool ggml_vk_vvm_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * env = getenv("GGML_VK_VVM_POOL");
+        enabled = (env != nullptr && env[0] == '1') ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static vvm::UnifiedMemoryPool * ggml_vk_vvm_get_pool(vk_device & device) {
+    std::lock_guard<std::mutex> lock(g_vvm_pools_mtx);
+
+    void * key = (void *)(VkDevice)device->device;
+    auto it = g_vvm_pools.find(key);
+    if (it != g_vvm_pools.end()) {
+        return it->second.pool.get();
+    }
+
+    vvm::DeviceConfig cfg;
+    cfg.physicalDevice = device->physical_device;
+    cfg.device = device->device;
+    if (device->compute_queue != nullptr) {
+        cfg.graphicsQueueFamily = device->compute_queue->queue_family_index;
+        cfg.computeQueueFamily = device->compute_queue->queue_family_index;
+        cfg.graphicsQueue = device->compute_queue->handle->queue;
+        cfg.computeQueue = cfg.graphicsQueue;
+    }
+    if (device->transfer_queue != nullptr) {
+        cfg.transferQueueFamily = device->transfer_queue->queue_family_index;
+        cfg.transferQueue = device->transfer_queue->handle->queue;
+    } else {
+        cfg.transferQueueFamily = cfg.computeQueueFamily;
+        cfg.transferQueue = cfg.computeQueue;
+    }
+
+    // Large contiguous blocks, no artificial caps: budget checks disabled by
+    // default in PoolConfig; unlimited block count so the pool can grow to the
+    // full heap as ggml requests memory.
+    vvm::PoolConfig pcfg;
+    pcfg.blockSize = 1ull * 1024ull * 1024ull * 1024ull;  // 1 GiB blocks (match ggml suballocation size)
+    pcfg.maxBlocks = 0;                                   // unlimited
+    pcfg.enableHostVisible = false;                       // offload tiers: Phase 3
+    pcfg.enableExternal = false;                          // cross-GPU import: Phase 2
+    // Match ggml-vulkan's own buffer creation exactly: when the device has
+    // bufferDeviceAddress enabled, pool buffers must also carry
+    // SHADER_DEVICE_ADDRESS usage + the DEVICE_ADDRESS allocate flag, or the
+    // driver places/maps them differently (measured -7% decode on RDNA3).
+    pcfg.enableDeviceAddress = device->buffer_device_address;
+    // Match ggml-vulkan's own allocation priority: without VK_EXT_memory_priority
+    // at max priority the driver degrades/evicts blocks as the heap fills,
+    // silently turning VRAM into PCIe-bound memory.
+    pcfg.memoryPriority = device->memory_priority ? 1.0f : 0.0f;
+
+    // Experiment knobs (benchmarking matrix):
+    //   GGML_VVM_BLOCK_SIZE  = block size in bytes (default 1 GiB)
+    //   GGML_VVM_PURE_LOCAL  = 0 -> allow ReBAR (host-visible) VRAM types.
+    //   Default is PURE DEVICE_LOCAL: on Intel Arc the ReBAR-mapped pool
+    //   blocks lost ~3x decode bandwidth; pure local matches ggml parity.
+    if (const char* bs = getenv("GGML_VVM_BLOCK_SIZE")) {
+        unsigned long long v = strtoull(bs, nullptr, 0);
+        if (v >= 256ull * 1024ull) {
+            pcfg.blockSize = v;   // == minAlignment -> every request goes dedicated (pass-through mode)
+        }
+    }
+    pcfg.preferPureDeviceLocal = true;
+    if (const char* pl = getenv("GGML_VVM_PURE_LOCAL")) {
+        if (pl[0] == '0') {
+            pcfg.preferPureDeviceLocal = false;
+        }
+    }
+    if (const char* nd = getenv("GGML_VVM_NO_DEDICATED")) {
+        if (nd[0] == '1') {
+            pcfg.dedicatedAllocateInfo = false;
+        }
+    }
+    // Chonk Chunks: buffer bases on 2 MB driver-page boundaries + small
+    // allocations routed to 64 MB chunk blocks instead of claiming 1 GiB.
+    pcfg.allocationAlignment = 2ull * 1024ull * 1024ull;
+    pcfg.smallAllocThreshold = 16ull * 1024ull * 1024ull;
+    pcfg.chunkBlockSize = 64ull * 1024ull * 1024ull;
+    if (const char* ba = getenv("GGML_VVM_BASE_ALIGN")) {
+        unsigned long long v = strtoull(ba, nullptr, 0);
+        pcfg.allocationAlignment = v;   // 0 disables (falls back to minAlignment)
+    }
+    if (const char* cm = getenv("GGML_VVM_CHUNK_MB")) {
+        unsigned long long v = strtoull(cm, nullptr, 0);
+        if (v == 0) {
+            pcfg.smallAllocThreshold = 0;   // disable chunk routing
+            pcfg.chunkBlockSize = 0;
+        } else {
+            pcfg.chunkBlockSize = v * 1024ull * 1024ull;
+        }
+    }
+
+    auto created = vvm::UnifiedMemoryPool::create(cfg, pcfg);
+    if (!created.has_value()) {
+        throw std::runtime_error("ggml_vulkan: failed to create VVM (Chonk Buffer) pool");
+    }
+    GGML_LOG_INFO("ggml_vulkan: VVM Chonk Buffer pool created\n");
+
+    vvm_pool_entry entry;
+    entry.pool = std::make_unique<vvm::UnifiedMemoryPool>(std::move(*created));
+    entry.device = device;
+    entry.name = device->name;
+    vvm::UnifiedMemoryPool * raw = entry.pool.get();
+    g_vvm_pools[key] = std::move(entry);
+    return raw;
+}
+
+static vk_buffer ggml_vk_vvm_create_buffer(vk_device & device, size_t size) {
+    // Bisect knob: create the pool (init state identical) but allocate via
+    // ggml's native path. Isolates whether the decode penalty lives in the
+    // allocation calls or in pool initialization state.
+    if (const char* pt = getenv("GGML_VVM_PASSTHROUGH_ALLOC")) {
+        if (pt[0] == '1') {
+            return ggml_vk_create_buffer_device(device, size);
+        }
+    }
+    vvm::UnifiedMemoryPool * pool = ggml_vk_vvm_get_pool(device);
+
+    vvm::AllocDesc desc;
+    desc.size = size;
+    desc.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (device->buffer_device_address) {
+        desc.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    }
+    desc.memoryUsage = vvm::MemoryUsage::GpuOnly;
+
+    auto alloc = pool->allocate(desc);
+    if (!alloc.has_value()) {
+        throw std::runtime_error("ggml_vulkan: VVM pool allocation failed for " + std::to_string(size) + " bytes");
+    }
+
+    vk_buffer_struct * raw = new vk_buffer_struct();
+    raw->buffer = alloc->buffer;
+    raw->memory_property_flags = vk::MemoryPropertyFlagBits::eDeviceLocal;
+    raw->ptr = nullptr;
+    raw->size = size;
+    raw->device = device;
+    if (device->buffer_device_address) {
+        raw->bda_addr = device->device.getBufferAddress({ raw->buffer });
+    }
+    raw->external_memory = true;
+
+    // Guard keeps the RAII allocation handle alive until the last buffer
+    // reference dies; ~UniqueAllocation returns the memory to the pool.
+    struct vvm_alloc_guard {
+        vvm::UniqueAllocation alloc;
+    };
+    auto guard = std::make_shared<vvm_alloc_guard>(
+        vvm_alloc_guard{ vvm::UniqueAllocation::make(pool, std::move(*alloc)) });
+
+    return vk_buffer(raw, [guard](vk_buffer_struct * p) {
+        delete p;
+    });
+}
+#else
+static vk_buffer ggml_vk_vvm_create_buffer(vk_device & device, size_t size) {
+    UNUSED(device);
+    UNUSED(size);
+    throw std::runtime_error("ggml_vulkan: VVM support not compiled in");
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// VVM public API (Chonk Buffer): pool stats + auto tensor placement.
+// Declared in ggml-vulkan.h; safe no-ops when built without GGML_VK_VVM_POOL.
+// ---------------------------------------------------------------------------
+
+const char * ggml_vulkan_vvm_stats_json(void) {
+#if defined(GGML_VK_VVM_POOL)
+    static std::string json;
+    json = "[]";
+    if (!ggml_vk_vvm_enabled()) {
+        return json.c_str();
+    }
+    std::lock_guard<std::mutex> lock(g_vvm_pools_mtx);
+    json = "[";
+    bool first = true;
+    char buf[512];
+    for (auto & kv : g_vvm_pools) {
+        vvm_pool_entry & e = kv.second;
+        const vvm::PoolStats s = e.pool->getStats();
+        if (!first) json += ",";
+        first = false;
+        snprintf(buf, sizeof(buf),
+            "{\"device\":\"%s\",\"blockSize\":%llu,\"blocks\":%u,"
+            "\"allocations\":%u,\"dedicated\":%u,"
+            "\"capacityBytes\":%llu,\"usedBytes\":%llu,\"freeBytes\":%llu,"
+            "\"largestFreeBytes\":%llu,\"fragmentation\":%.3f}",
+            e.name.c_str(),
+            (unsigned long long)(e.pool->getConfig().blockSize),
+            s.blockCount, s.allocationCount, s.dedicatedCount,
+            (unsigned long long)s.totalCapacity, (unsigned long long)s.totalUsed,
+            (unsigned long long)s.totalFree, (unsigned long long)s.largestFreeBlock,
+            (double)s.fragmentationRatio);
+        json += buf;
+    }
+    json += "]";
+    return json.c_str();
+#else
+    return "[]";
+#endif
+}
+
+void ggml_vulkan_vvm_auto_begin(void) {
+#if defined(GGML_VK_VVM_POOL)
+    g_vvm_auto_budgets.clear();
+    g_vvm_auto_started = false;
+    if (!ggml_vk_vvm_enabled()) {
+        return;
+    }
+    // Snapshot free VRAM per Vulkan device (Vulkan devices only - the CPU
+    // backend is intentionally excluded from VVM auto placement).
+    const int count = ggml_backend_vk_get_device_count();
+    constexpr uint64_t kHeadroom = 512ull * 1024ull * 1024ull;  // KV/activations headroom
+    for (int i = 0; i < count; ++i) {
+        size_t free_bytes = 0;
+        size_t total_bytes = 0;
+        ggml_backend_vk_get_device_memory(i, &free_bytes, &total_bytes);
+        if (free_bytes <= kHeadroom) {
+            continue;
+        }
+        vvm_auto_budget b;
+        b.buft = ggml_backend_vk_buffer_type((size_t)i);
+        char desc[256] = {};
+        ggml_backend_vk_get_device_description(i, desc, sizeof(desc));
+        b.name = desc;
+        b.remaining = free_bytes - kHeadroom;
+        g_vvm_auto_budgets.push_back(b);
+    }
+    if (!g_vvm_auto_budgets.empty()) {
+        g_vvm_auto_started = true;
+        std::string msg = "ggml_vulkan: VVM auto-split budgets:";
+        for (auto & b : g_vvm_auto_budgets) {
+            msg += " " + b.name + "=" + std::to_string(b.remaining / 1048576) + "MiB";
+        }
+        GGML_LOG_INFO("%s\n", msg.c_str());
+    }
+#else
+    UNUSED(g_vvm_auto_budgets);
+    UNUSED(g_vvm_auto_started);
+#endif
+}
+
+ggml_backend_buffer_type_t ggml_vulkan_vvm_auto_pick(size_t nbytes) {
+#if defined(GGML_VK_VVM_POOL)
+    if (!g_vvm_auto_started || g_vvm_auto_budgets.empty()) {
+        return nullptr;
+    }
+    // Weighted best-fit: pick the device with the most remaining budget.
+    vvm_auto_budget * best = nullptr;
+    for (auto & b : g_vvm_auto_budgets) {
+        if (best == nullptr || b.remaining > best->remaining) {
+            best = &b;
+        }
+    }
+    if (best == nullptr) {
+        return nullptr;
+    }
+    if (nbytes <= best->remaining) {
+        best->remaining -= nbytes;
+    } else {
+        // Over-budget: still place here (weights must go somewhere) but zero
+        // the budget so subsequent tensors prefer other devices.
+        best->remaining = 0;
+    }
+    return best->buft;
+#else
+    UNUSED(nbytes);
+    return nullptr;
+#endif
+}
+
+// ============================ end VVM integration ============================
 
 static vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
     vk_buffer buf;
@@ -16955,8 +17278,19 @@ static ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backe
 
     vk_buffer dev_buffer = nullptr;
     try {
-        dev_buffer = ggml_vk_create_buffer_device(ctx->device, size);
+#if defined(GGML_VK_VVM_POOL)
+        if (ggml_vk_vvm_enabled()) {
+            dev_buffer = ggml_vk_vvm_create_buffer(ctx->device, size);
+        } else
+#endif
+        {
+            dev_buffer = ggml_vk_create_buffer_device(ctx->device, size);
+        }
     } catch (const vk::SystemError& e) {
+        fprintf(stderr, "ggml_vulkan: VVM buffer alloc failed (%zu bytes): %s\n", size, e.what());
+        return nullptr;
+    } catch (const std::runtime_error& e) {
+        fprintf(stderr, "ggml_vulkan: VVM buffer alloc failed (%zu bytes): %s\n", size, e.what());
         return nullptr;
     }
 
@@ -16972,6 +17306,14 @@ static size_t ggml_backend_vk_buffer_type_get_alignment(ggml_backend_buffer_type
 
 static size_t ggml_backend_vk_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
     ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
+#if defined(GGML_VK_VVM_POOL)
+    // Chonk Buffer: cap reported max allocation size at the pool block size so
+    // ggml's allocators split their reservations into chunks that sub-allocate
+    // from Chonk blocks instead of falling into per-buffer dedicated memory.
+    if (ggml_vk_vvm_enabled()) {
+        return 1ull * 1024ull * 1024ull * 1024ull;  // == VVM pool blockSize
+    }
+#endif
     return ctx->device->suballocation_block_size;
 }
 
@@ -21056,3 +21398,5 @@ static void ggml_vk_check_results_1(ggml_backend_vk_context * ctx, ggml_cgraph *
 #endif
 
 GGML_BACKEND_DL_IMPL(ggml_backend_vk_reg)
+
+

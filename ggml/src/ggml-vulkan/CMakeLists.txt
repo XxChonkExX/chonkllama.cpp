@@ -112,6 +112,22 @@ if (Vulkan_FOUND)
     target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan)
     target_include_directories(ggml-vulkan PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
+    # VVM (Chonk Buffer) pool integration: link against an external
+    # VulkanVM (vvm::UnifiedMemoryPool) build and route tensor buffer
+    # allocations through it when GGML_VK_VVM_POOL=1 is set at runtime.
+    option(GGML_VK_VVM_POOL "Enable Chonk Buffer (VulkanVM UnifiedMemoryPool) integration" OFF)
+    set(VVM_ROOT "" CACHE PATH "Path to VulkanVM repo (containing include/ and a built vulkan_vm.lib)")
+    if (GGML_VK_VVM_POOL)
+        if (NOT VVM_ROOT)
+            message(FATAL_ERROR "GGML_VK_VVM_POOL requires VVM_ROOT pointing at the VulkanVM repo")
+        endif()
+        find_library(VVM_LIBRARY NAMES vulkan_vm PATHS "${VVM_ROOT}/build_infer" "${VVM_ROOT}/build" REQUIRED)
+        target_include_directories(ggml-vulkan PRIVATE "${VVM_ROOT}/include")
+        target_link_libraries(ggml-vulkan PRIVATE ${VVM_LIBRARY})
+        target_compile_definitions(ggml-vulkan PRIVATE GGML_VK_VVM_POOL)
+        message(STATUS "VVM Chonk Buffer pool integration enabled: ${VVM_LIBRARY}")
+    endif()
+
     # Workaround to the "can't dereference invalidated vector iterator" bug in clang-cl debug build
     # Possibly relevant: https://stackoverflow.com/questions/74748276/visual-studio-no-displays-the-correct-length-of-stdvector
     if (MSVC AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")

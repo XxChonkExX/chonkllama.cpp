@@ -283,6 +283,48 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
     }
 }
 
+// VVM tensor placement: like parse_tensor_buffer_overrides, but targets may
+// also be "auto" (distribute across Vulkan GPUs by free VRAM). Auto entries
+// are stored with a NULL buft and resolved per-tensor at load time via
+// ggml_vulkan_vvm_auto_pick().
+static void parse_tensor_buffer_overrides_vvm(const std::string & value, std::vector<llama_model_tensor_buft_override> & overrides) {
+    ggml_backend_load_all();
+
+    std::map<std::string, ggml_backend_buffer_type_t> buft_list;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        auto * dev = ggml_backend_dev_get(i);
+        auto * buft = ggml_backend_dev_buffer_type(dev);
+        if (buft) {
+            buft_list[ggml_backend_buft_name(buft)] = buft;
+        }
+    }
+
+    for (const auto & override : string_split<std::string>(value, ',')) {
+        std::string::size_type pos = override.find('=');
+        if (pos == std::string::npos) {
+            throw std::invalid_argument("invalid value");
+        }
+        std::string tensor_name = override.substr(0, pos);
+        std::string target = override.substr(pos + 1);
+
+        static std::list<std::string> buft_overrides;
+        if (target == "auto") {
+            buft_overrides.push_back(tensor_name);
+            overrides.push_back({buft_overrides.back().c_str(), nullptr});
+            continue;
+        }
+        if (buft_list.find(target) == buft_list.end()) {
+            printf("Available buffer types (or use 'auto'):\n");
+            for (const auto & it : buft_list) {
+                printf("  %s\n", ggml_backend_buft_name(it.second));
+            }
+            throw std::invalid_argument("unknown VVM split target");
+        }
+        buft_overrides.push_back(tensor_name);
+        overrides.push_back({buft_overrides.back().c_str(), buft_list.at(target)});
+    }
+}
+
 static std::string clean_file_name(const std::string & fname) {
     std::string clean_fname = fname;
     string_replace_all(clean_fname, "\\", "_");
@@ -2752,6 +2794,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             parse_tensor_buffer_overrides(value, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_OVERRIDE_TENSOR"));
+    add_opt(common_arg(
+        {"-vsplit", "--vvm-split"}, "<tensor name pattern>=<target>,...",
+        "VVM (Chonk Buffer) tensor placement: route matching tensors to a Vulkan device "
+        "('Vulkan0', 'Vulkan1', ...) or distribute them across all Vulkan GPUs by free "
+        "VRAM with 'auto'. Requires GGML_VK_VVM_POOL=1. Example: "
+        "--vvm-split 'exps=auto,ffn_.*=Vulkan1'", [](common_params & params, const std::string & value) {
+            parse_tensor_buffer_overrides_vvm(value, params.tensor_buft_overrides);
+        }
+    ).set_env("LLAMA_ARG_VVM_SPLIT"));
     add_opt(common_arg(
         {"-cmoe", "--cpu-moe"},
         "keep all Mixture of Experts (MoE) weights in the CPU",

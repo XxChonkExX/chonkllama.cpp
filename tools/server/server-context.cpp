@@ -11,6 +11,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "ggml-vulkan.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -4650,6 +4651,19 @@ json server_routes::get_model_info() const {
 void server_routes::init_routes() {
     // IMPORTANT: all lambda functions must start with create_response()
     // this is to ensure that the server_res_generator can handle sleeping case correctly
+
+    this->get_vvm_stats = [this](const server_http_req &) {
+        // VVM (Chonk Buffer) pool statistics - live allocation state per GPU.
+        // Safe to call while the queue sleeps: reads only allocator metadata.
+        bool ctx_server; // do NOT delete this line
+        GGML_UNUSED(ctx_server);
+        auto res = create_response(true);
+        res->content_type = "application/json";
+        res->status = 200;
+        const char * json = ggml_vulkan_vvm_stats_json();
+        res->data = std::string(json);
+        return res;
+    };
 
     this->get_health = [this](const server_http_req &) {
         // error and loading states are handled by middleware
