@@ -3916,8 +3916,20 @@ static vvm::UnifiedMemoryPool * ggml_vk_vvm_get_pool(vk_device & device) {
     pcfg.enableDeviceAddress = device->buffer_device_address;
     // Match ggml-vulkan's own allocation priority: without VK_EXT_memory_priority
     // at max priority the driver degrades/evicts blocks as the heap fills,
-    // silently turning VRAM into PCIe-bound memory.
+    // silently turning VRAM into PCIe-bound memory. (Only chained when the
+    // extension is enabled - GGML_VK_ENABLE_MEMORY_PRIORITY.)
     pcfg.memoryPriority = device->memory_priority ? 1.0f : 0.0f;
+    // VRAM budget (VRAM_OVERFLOW_FINDINGS.md): measured on RDNA3+Arc, legit
+    // dual-GPU splits commit 92-98% of per-GPU heap, so a hard fraction cap
+    // breaks valid workloads (0.95/0.97/0.98 all tested - the 40B@256K q8
+    // split needs ~97% on the XTX). The pool WARNS at >90% heap commitment
+    // and fails soft via vkAllocateMemory OOM past 100% (the spill cliff is
+    // above 100% anyway). Opt in to a hard cap via GGML_VK_VVM_HEAP_FRACTION
+    // (e.g. 0.90) ONLY if you prefer load-failure over spill on your box.
+    if (const char* hf = getenv("GGML_VK_VVM_HEAP_FRACTION")) {
+        float v = (float)atof(hf);
+        if (v > 0.0f && v <= 1.0f) pcfg.maxHeapFraction = v;
+    }
 
     // Experiment knobs (benchmarking matrix):
     //   GGML_VVM_BLOCK_SIZE  = block size in bytes (default 1 GiB)
@@ -21398,5 +21410,6 @@ static void ggml_vk_check_results_1(ggml_backend_vk_context * ctx, ggml_cgraph *
 #endif
 
 GGML_BACKEND_DL_IMPL(ggml_backend_vk_reg)
+
 
 
