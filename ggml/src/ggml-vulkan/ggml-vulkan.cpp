@@ -3976,7 +3976,17 @@ static vvm::UnifiedMemoryPool * ggml_vk_vvm_get_pool(vk_device & device) {
 
     auto created = vvm::UnifiedMemoryPool::create(cfg, pcfg);
     if (!created.has_value()) {
-        throw std::runtime_error("ggml_vulkan: failed to create VVM (Chonk Buffer) pool");
+        // Diagnostic: distinguish "third device appeared" (e.g. uma iGPU gets
+        // its first context buffer) from "same device, new VkDevice handle"
+        // (map-key miss on an already-pooled physical device).
+        char msg[512];
+        snprintf(msg, sizeof(msg),
+                 "ggml_vulkan: failed to create VVM (Chonk Buffer) pool "
+                 "[dev=%s VkDevice=%p phys=%s vendor=0x%04x mapsize=%zu]",
+                 device->name.c_str(), (void *)(VkDevice)device->device,
+                 device->properties.deviceName, device->properties.vendorID,
+                 g_vvm_pools.size());
+        throw std::runtime_error(msg);
     }
     GGML_LOG_INFO("ggml_vulkan: VVM Chonk Buffer pool created\n");
 
