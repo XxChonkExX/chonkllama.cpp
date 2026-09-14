@@ -17292,17 +17292,31 @@ static ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backe
     try {
 #if defined(GGML_VK_VVM_POOL)
         if (ggml_vk_vvm_enabled()) {
-            dev_buffer = ggml_vk_vvm_create_buffer(ctx->device, size);
+            try {
+                dev_buffer = ggml_vk_vvm_create_buffer(ctx->device, size);
+            } catch (const std::exception& e) {
+                // Fail-soft: pool creation/allocation can legitimately fail on
+                // a device whose heap the model already filled (late-created
+                // pools for context-init buffers after layer-split weight
+                // placement), or for a size class the pool cannot serve.
+                // Degrade to ggml's native path for this allocation instead of
+                // failing the whole model/context load. The caller-visible
+                // behavior (a live ggml buffer) is unchanged; only the
+                // allocator backing this one buffer differs.
+                GGML_LOG_WARN("ggml_vulkan: VVM pool alloc failed for %zu bytes (%s); "
+                              "falling back to native buffer path\n", size, e.what());
+                dev_buffer = ggml_vk_create_buffer_device(ctx->device, size);
+            }
         } else
 #endif
         {
             dev_buffer = ggml_vk_create_buffer_device(ctx->device, size);
         }
     } catch (const vk::SystemError& e) {
-        fprintf(stderr, "ggml_vulkan: VVM buffer alloc failed (%zu bytes): %s\n", size, e.what());
+        fprintf(stderr, "ggml_vulkan: buffer alloc failed (%zu bytes): %s\n", size, e.what());
         return nullptr;
     } catch (const std::runtime_error& e) {
-        fprintf(stderr, "ggml_vulkan: VVM buffer alloc failed (%zu bytes): %s\n", size, e.what());
+        fprintf(stderr, "ggml_vulkan: buffer alloc failed (%zu bytes): %s\n", size, e.what());
         return nullptr;
     }
 
