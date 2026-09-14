@@ -3956,10 +3956,16 @@ static vvm::UnifiedMemoryPool * ggml_vk_vvm_get_pool(vk_device & device) {
         }
     }
     // Chonk Chunks: buffer bases on 2 MB driver-page boundaries + small
-    // allocations routed to 64 MB chunk blocks instead of claiming 1 GiB.
+    // allocations routed to tiered chunk blocks instead of claiming 1 GiB.
+    // Tiers cover the observed serve-path small range (5/7 MB scratch,
+    // 41/58 MB context buffers); 180 MB+ stay on buddy blocks.
     pcfg.allocationAlignment = 2ull * 1024ull * 1024ull;
-    pcfg.smallAllocThreshold = 16ull * 1024ull * 1024ull;
-    pcfg.chunkBlockSize = 64ull * 1024ull * 1024ull;
+    pcfg.chunkTiers = {
+        {  1ull * 1024ull * 1024ull,   8ull * 1024ull * 1024ull},
+        {  4ull * 1024ull * 1024ull,  32ull * 1024ull * 1024ull},
+        { 16ull * 1024ull * 1024ull,  64ull * 1024ull * 1024ull},
+        { 64ull * 1024ull * 1024ull, 256ull * 1024ull * 1024ull},
+    };
     if (const char* ba = getenv("GGML_VVM_BASE_ALIGN")) {
         unsigned long long v = strtoull(ba, nullptr, 0);
         pcfg.allocationAlignment = v;   // 0 disables (falls back to minAlignment)
@@ -3969,6 +3975,7 @@ static vvm::UnifiedMemoryPool * ggml_vk_vvm_get_pool(vk_device & device) {
         if (v == 0) {
             pcfg.smallAllocThreshold = 0;   // disable chunk routing
             pcfg.chunkBlockSize = 0;
+            pcfg.chunkTiers.clear();
         } else {
             pcfg.chunkBlockSize = v * 1024ull * 1024ull;
         }
