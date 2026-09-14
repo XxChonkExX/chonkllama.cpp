@@ -3938,8 +3938,10 @@ static vvm::UnifiedMemoryPool * ggml_vk_vvm_get_pool(vk_device & device) {
     //   blocks lost ~3x decode bandwidth; pure local matches ggml parity.
     if (const char* bs = getenv("GGML_VVM_BLOCK_SIZE")) {
         unsigned long long v = strtoull(bs, nullptr, 0);
-        if (v >= 256ull * 1024ull) {
+        if (v >= 256ull * 1024ull && v <= 8ull * 1024ull * 1024ull * 1024ull) {
             pcfg.blockSize = v;   // == minAlignment -> every request goes dedicated (pass-through mode)
+        } else if (v != 0) {
+            GGML_LOG_WARN("ggml_vulkan: ignoring out-of-range GGML_VVM_BLOCK_SIZE=%llu (256 KiB..8 GiB)\n", v);
         }
     }
     pcfg.preferPureDeviceLocal = true;
