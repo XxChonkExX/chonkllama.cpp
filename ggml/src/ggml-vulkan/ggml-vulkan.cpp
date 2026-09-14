@@ -844,6 +844,10 @@ static bool ggml_vk_lightning_indexer_k_type_supported(ggml_type type) {
     return std::find(lightning_indexer_k_types.begin(), lightning_indexer_k_types.end(), type) != lightning_indexer_k_types.end();
 }
 
+#if defined(GGML_VK_VVM_POOL)
+namespace vvm { class UnifiedMemoryPool; }   // complete def: vulkan_vm.hpp (below)
+#endif
+
 struct vk_device_struct {
     std::recursive_mutex mutex;
     std::mutex queue_submit_mutex;
@@ -1190,6 +1194,16 @@ struct vk_device_struct {
 
     ggml_backend_buffer_type buffer_type;
 
+#if defined(GGML_VK_VVM_POOL)
+    // VVM Chonk Buffer pool: stored directly on the device struct (shared_ptr,
+    // lives as long as the device) instead of a static map. The static map's
+    // entries were being lost between model load and context init on
+    // multi-device setups, causing mapsize=0 and native fallback.
+    std::unique_ptr<vvm::UnifiedMemoryPool> vvm_pool;
+#endif
+
+    ~vk_device_struct();
+
     bool disable_fusion;
     bool disable_host_visible_vidmem;
     bool allow_sysmem_fallback;
@@ -1197,35 +1211,9 @@ struct vk_device_struct {
 
     std::unique_ptr<vk_memory_logger> memory_logger;
 
-    ~vk_device_struct() {
-        VK_LOG_DEBUG("destroy device " << name);
-
-        device.destroyFence(fence);
-
-        ggml_vk_destroy_buffer(sync_staging);
-
-        if (compute_queue) compute_queue->cmd_pool.destroy(device);
-        if (transfer_queue) transfer_queue->cmd_pool.destroy(device);
-
-        // Explicitly clear to ensure queues drop their shared_ptrs to handles
-        // before the Vulkan logical device instance is destroyed
-        compute_queue.reset();
-        transfer_queue.reset();
-
-        for (auto& pipeline : all_pipelines) {
-            if (pipeline.expired()) {
-                continue;
-            }
-
-            vk_pipeline pl = pipeline.lock();
-            ggml_vk_destroy_pipeline(device, pl);
-        }
-        all_pipelines.clear();
-
-        device.destroyDescriptorSetLayout(dsl);
-
-        device.destroy();
-    }
+    // Out-of-line (defined after the vulkan_vm.hpp include) so the
+    // unique_ptr<vvm::UnifiedMemoryPool> member above has a complete type
+    // when its destructor is instantiated.
 };
 
 void vk_command_pool::init(vk_device& device, vk_queue *q_) {
@@ -3845,15 +3833,12 @@ static vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size);
 // defining GGML_VK_VVM_POOL at build time and setting GGML_VK_VVM_POOL=1 at
 // runtime. Pools are created lazily per VkDevice and intentionally live until
 // process exit (buffer lifetimes may outlast backend teardown ordering).
+// Pools are owned by their vk_device_struct (see vvm_pool member); the stats
+// API enumerates vk_instance.devices.
 
-// File-scope pool registry so the stats/auto-placement API can iterate pools.
-struct vvm_pool_entry {
-    std::unique_ptr<vvm::UnifiedMemoryPool> pool;
-    vk_device device;                 // owning ggml-vulkan device
-    std::string name;                 // e.g. "Vulkan0"
-};
+// Serializes the create-once check in ggml_vk_vvm_get_pool (stats reads the
+// pool via the device struct under this lock too).
 static std::mutex g_vvm_pools_mtx;
-static std::unordered_map<void *, vvm_pool_entry> g_vvm_pools;   // key = VkDevice
 
 // Auto-split placement state (--vvm-split pattern=auto): per-device remaining
 // byte budgets, snapshotted from free VRAM at load start and consumed as
@@ -3878,10 +3863,10 @@ static bool ggml_vk_vvm_enabled() {
 static vvm::UnifiedMemoryPool * ggml_vk_vvm_get_pool(vk_device & device) {
     std::lock_guard<std::mutex> lock(g_vvm_pools_mtx);
 
-    void * key = (void *)(VkDevice)device->device;
-    auto it = g_vvm_pools.find(key);
-    if (it != g_vvm_pools.end()) {
-        return it->second.pool.get();
+    // Pool lives on the device struct (shared_ptr, process lifetime): no map,
+    // no key-miss on fresh VkDevice handles, no static-storage lifetime traps.
+    if (device->vvm_pool) {
+        return device->vvm_pool.get();
     }
 
     vvm::DeviceConfig cfg;
@@ -3983,27 +3968,19 @@ static vvm::UnifiedMemoryPool * ggml_vk_vvm_get_pool(vk_device & device) {
 
     auto created = vvm::UnifiedMemoryPool::create(cfg, pcfg);
     if (!created.has_value()) {
-        // Diagnostic: distinguish "third device appeared" (e.g. uma iGPU gets
-        // its first context buffer) from "same device, new VkDevice handle"
-        // (map-key miss on an already-pooled physical device).
         char msg[512];
         snprintf(msg, sizeof(msg),
                  "ggml_vulkan: failed to create VVM (Chonk Buffer) pool "
-                 "[dev=%s VkDevice=%p phys=%s vendor=0x%04x mapsize=%zu]",
+                 "[dev=%s VkDevice=%p phys=%s vendor=0x%04x]",
                  device->name.c_str(), (void *)(VkDevice)device->device,
-                 device->properties.deviceName, device->properties.vendorID,
-                 g_vvm_pools.size());
+                 device->properties.deviceName, device->properties.vendorID);
         throw std::runtime_error(msg);
     }
-    GGML_LOG_INFO("ggml_vulkan: VVM Chonk Buffer pool created\n");
+    GGML_LOG_INFO("ggml_vulkan: VVM Chonk Buffer pool created for %s\n",
+                  device->name.c_str());
 
-    vvm_pool_entry entry;
-    entry.pool = std::make_unique<vvm::UnifiedMemoryPool>(std::move(*created));
-    entry.device = device;
-    entry.name = device->name;
-    vvm::UnifiedMemoryPool * raw = entry.pool.get();
-    g_vvm_pools[key] = std::move(entry);
-    return raw;
+    device->vvm_pool = std::make_unique<vvm::UnifiedMemoryPool>(std::move(*created));
+    return device->vvm_pool.get();
 }
 
 static vk_buffer ggml_vk_vvm_create_buffer(vk_device & device, size_t size) {
@@ -4062,6 +4039,43 @@ static vk_buffer ggml_vk_vvm_create_buffer(vk_device & device, size_t size) {
 }
 #endif
 
+// Out-of-line device destructor. Defined after the vulkan_vm.hpp include so
+// the unique_ptr<vvm::UnifiedMemoryPool> member has a complete type here.
+vk_device_struct::~vk_device_struct() {
+    VK_LOG_DEBUG("destroy device " << name);
+
+#if defined(GGML_VK_VVM_POOL)
+    // Free pool memory while the VkDevice is still alive.
+    vvm_pool.reset();
+#endif
+
+    device.destroyFence(fence);
+
+    ggml_vk_destroy_buffer(sync_staging);
+
+    if (compute_queue) compute_queue->cmd_pool.destroy(device);
+    if (transfer_queue) transfer_queue->cmd_pool.destroy(device);
+
+    // Explicitly clear to ensure queues drop their shared_ptrs to handles
+    // before the Vulkan logical device instance is destroyed
+    compute_queue.reset();
+    transfer_queue.reset();
+
+    for (auto& pipeline : all_pipelines) {
+        if (pipeline.expired()) {
+            continue;
+        }
+
+        vk_pipeline pl = pipeline.lock();
+        ggml_vk_destroy_pipeline(device, pl);
+    }
+    all_pipelines.clear();
+
+    device.destroyDescriptorSetLayout(dsl);
+
+    device.destroy();
+}
+
 // ---------------------------------------------------------------------------
 // VVM public API (Chonk Buffer): pool stats + auto tensor placement.
 // Declared in ggml-vulkan.h; safe no-ops when built without GGML_VK_VVM_POOL.
@@ -4078,9 +4092,12 @@ const char * ggml_vulkan_vvm_stats_json(void) {
     json = "[";
     bool first = true;
     char buf[512];
-    for (auto & kv : g_vvm_pools) {
-        vvm_pool_entry & e = kv.second;
-        const vvm::PoolStats s = e.pool->getStats();
+    for (size_t i = 0; i < GGML_VK_MAX_DEVICES; i++) {
+        vk_device dev = vk_instance.devices[i];
+        if (dev == nullptr || !dev->vvm_pool) {
+            continue;
+        }
+        const vvm::PoolStats s = dev->vvm_pool->getStats();
         if (!first) json += ",";
         first = false;
         snprintf(buf, sizeof(buf),
@@ -4088,8 +4105,8 @@ const char * ggml_vulkan_vvm_stats_json(void) {
             "\"allocations\":%u,\"dedicated\":%u,"
             "\"capacityBytes\":%llu,\"usedBytes\":%llu,\"freeBytes\":%llu,"
             "\"largestFreeBytes\":%llu,\"fragmentation\":%.3f}",
-            e.name.c_str(),
-            (unsigned long long)(e.pool->getConfig().blockSize),
+            dev->name.c_str(),
+            (unsigned long long)(dev->vvm_pool->getConfig().blockSize),
             s.blockCount, s.allocationCount, s.dedicatedCount,
             (unsigned long long)s.totalCapacity, (unsigned long long)s.totalUsed,
             (unsigned long long)s.totalFree, (unsigned long long)s.largestFreeBlock,
