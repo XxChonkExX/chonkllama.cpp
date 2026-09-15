@@ -4189,6 +4189,86 @@ ggml_backend_buffer_type_t ggml_vulkan_vvm_auto_pick(size_t nbytes) {
 #endif
 }
 
+// Planner state: one PlacementPlan per model load, resolved per tensor name.
+// Guarded by g_vvm_pools_mtx (already held on this path only at begin).
+static vvm::PlacementPlan g_vvm_plan;
+static bool g_vvm_plan_ready = false;
+
+void ggml_vulkan_vvm_auto_plan(const char * model_path, uint64_t kv_bytes) {
+#if defined(GGML_VK_VVM_POOL)
+    std::lock_guard<std::mutex> lock(g_vvm_pools_mtx);
+    g_vvm_plan_ready = false;
+    if (!ggml_vk_vvm_enabled() || model_path == nullptr || model_path[0] == 0) {
+        return;
+    }
+    auto specs = vvm::read_gguf_inventory(model_path);
+    if (specs.empty()) {
+        GGML_LOG_WARN("ggml_vulkan: VVM auto-plan: no inventory for %s, budget fallback\n", model_path);
+        return;
+    }
+    // Consumer filter: this binary serves Vulkan + CPU only. HIP/Level0
+    // entries describe the same physical GPUs the transient Vulkan listing
+    // also reports, so dropping them loses nothing here.
+    auto devices = vvm::enumerate_all_devices();
+    std::vector<vvm::BackendDeviceInfo> mine;
+    for (auto & d : devices) {
+        if (d.source == vvm::DeviceSource::Vulkan) {
+            mine.push_back(d);
+        }
+    }
+    g_vvm_plan = vvm::auto_place_experts(mine, specs, kv_bytes, 0.90f);
+    g_vvm_plan_ready = true;
+    GGML_LOG_INFO("ggml_vulkan: VVM auto-plan: %s\n", g_vvm_plan.summary);
+#else
+    UNUSED(model_path);
+    UNUSED(kv_bytes);
+#endif
+}
+
+ggml_backend_buffer_type_t ggml_vulkan_vvm_auto_pick_named(const char * tensor_name, size_t nbytes) {
+#if defined(GGML_VK_VVM_POOL)
+    // Snapshot the placement decision under the lock, resolve buffer types
+    // after (device creation is slow and must not run under the pool mutex).
+    bool havePlan = false;
+    vvm::TensorClass cls = vvm::TensorClass::Other;
+    vvm::ExpertPlacement ep{};
+    int32_t denseIdx = -1;
+    {
+        std::lock_guard<std::mutex> lock(g_vvm_pools_mtx);
+        if (g_vvm_plan_ready && tensor_name != nullptr) {
+            havePlan = true;
+            int32_t layer = -1;
+            cls = vvm::classify_tensor(tensor_name, &layer);
+            if (cls == vvm::TensorClass::Expert && layer >= 0 &&
+                static_cast<size_t>(layer) < g_vvm_plan.experts.size()) {
+                ep = g_vvm_plan.experts[static_cast<size_t>(layer)];
+            }
+            denseIdx = g_vvm_plan.denseDeviceIndex;
+        }
+    }
+    if (havePlan) {
+        if (cls == vvm::TensorClass::LookupTable) {
+            return ggml_backend_cpu_buffer_type();
+        }
+        if (cls == vvm::TensorClass::Expert) {
+            if (ep.onCpu || ep.deviceIndex < 0) {
+                return ggml_backend_cpu_buffer_type();
+            }
+            return ggml_backend_vk_buffer_type((size_t)ep.deviceIndex);
+        }
+        // Dense/attention/head: the plan's dense device (Vulkan index here).
+        if (denseIdx < 0) {
+            return ggml_backend_cpu_buffer_type();
+        }
+        return ggml_backend_vk_buffer_type((size_t)denseIdx);
+    }
+    return ggml_vulkan_vvm_auto_pick(nbytes);
+#else
+    UNUSED(tensor_name);
+    return ggml_vulkan_vvm_auto_pick(nbytes);
+#endif
+}
+
 // ============================ end VVM integration ============================
 
 static vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {

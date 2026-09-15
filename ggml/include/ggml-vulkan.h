@@ -32,6 +32,15 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_vk_reg(void);
 // Vulkan devices proportionally to their remaining budget.
 GGML_BACKEND_API void ggml_vulkan_vvm_auto_begin(void);
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_vulkan_vvm_auto_pick(size_t nbytes);
+// Planner path: compute the full auto-placement plan ONCE from the model
+// file's tensor inventory (names+sizes read from the GGUF itself), then
+// resolve per tensor by NAME. The plan rediscovers the measured champion
+// (dense on the fastest GPU, ~14/48 expert layers on GPU, rest on CPU)
+// from first principles - no hand-tuned --n-cpu-moe needed.
+// kv_bytes: expected KV cache size (reserves dense-device headroom).
+// Falls back to budget-based auto_pick() for tensors outside the plan.
+GGML_BACKEND_API void ggml_vulkan_vvm_auto_plan(const char * model_path, uint64_t kv_bytes);
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_vulkan_vvm_auto_pick_named(const char * tensor_name, size_t nbytes);
 // Returns a JSON array of live Chonk Buffer pools: device, block size, block
 // count, allocations, used/free/capacity bytes, fragmentation. The returned
 // pointer is valid until the next call.

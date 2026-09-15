@@ -559,12 +559,21 @@ llama_model_loader::llama_model_loader(
 
     // VVM auto placement: snapshot per-device free-VRAM budgets once, before
     // any tensor buffer is allocated, so 'auto' overrides distribute weights
-    // proportionally to what each Vulkan GPU actually has free.
+    // proportionally to what each Vulkan GPU actually has free. When the
+    // planner is available it additionally computes the full placement plan
+    // from the model file's own tensor inventory (names+sizes), so expert
+    // layers land per the measured policy with no hand-tuned --n-cpu-moe.
     if (tensor_buft_overrides) {
         for (const auto * p = tensor_buft_overrides; p->pattern != nullptr; ++p) {
             if (p->buft == nullptr) {
 #if defined(VVM_AUTO_PLACEMENT)
                 ggml_vulkan_vvm_auto_begin();
+                // 512 MiB KV headroom matches the auto-budget headroom
+                // philosophy; the plan reserves it on the dense device.
+                // (A --vvm-auto-kv-mib flag can thread the real -c later.)
+                if (!fname.empty()) {
+                    ggml_vulkan_vvm_auto_plan(fname.c_str(), 512ull * 1024ull * 1024ull);
+                }
 #endif
                 break;
             }
@@ -1247,9 +1256,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 if (std::regex_search(tensor_name, pattern)) {
                     if (overrides->buft == nullptr) {
 #if defined(VVM_AUTO_PLACEMENT)
-                        // VVM auto placement: pick the Vulkan device with the
-                        // most remaining free-VRAM budget for this tensor.
-                        buft = ggml_vulkan_vvm_auto_pick(ggml_nbytes(t_meta));
+                        // VVM auto placement: planner-resolved per-tensor
+                        // placement (falls back to budget-based pick for
+                        // tensors outside the plan).
+                        buft = ggml_vulkan_vvm_auto_pick_named(tensor_name.c_str(), ggml_nbytes(t_meta));
                         if (buft == nullptr) {
                             // VVM unavailable - fall through to default placement.
                             break;
