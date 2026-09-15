@@ -953,6 +953,47 @@ static vvm::UnifiedMemoryPool * ggml_hip_vvm_get_pool(int device) {
     entry.pool = std::make_unique<vvm::UnifiedMemoryPool>(std::move(*created));
     return entry.pool.get();
 }
+
+// Chonk Buffer pool statistics for HIP: same JSON schema as
+// ggml_vulkan_vvm_stats_json (per-device pool state for /vvm/stats).
+const char * ggml_hip_vvm_stats_json(void) {
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_VVM_POOL)
+    static std::string json;
+    json = "[]";
+    if (!ggml_hip_vvm_enabled()) {
+        return json.c_str();
+    }
+    std::lock_guard<std::mutex> lock(g_hip_vvm_mtx);
+    json = "[";
+    bool first = true;
+    char buf[512];
+    for (int i = 0; i < GGML_CUDA_MAX_DEVICES; i++) {
+        auto & entry = g_hip_vvm_pools[i];
+        if (!entry.pool) {
+            continue;
+        }
+        const vvm::PoolStats s = entry.pool->getStats();
+        if (!first) json += ",";
+        first = false;
+        snprintf(buf, sizeof(buf),
+            "{\"device\":\"%s%d\",\"blockSize\":%llu,\"blocks\":%u,"
+            "\"allocations\":%u,\"dedicated\":%u,"
+            "\"capacityBytes\":%llu,\"usedBytes\":%llu,\"freeBytes\":%llu,"
+            "\"largestFreeBytes\":%llu,\"fragmentation\":%.3f}",
+            GGML_CUDA_NAME, i,
+            (unsigned long long)(entry.pool->getConfig().blockSize),
+            s.blockCount, s.allocationCount, s.dedicatedCount,
+            (unsigned long long)s.totalCapacity, (unsigned long long)s.totalUsed,
+            (unsigned long long)s.totalFree, (unsigned long long)s.largestFreeBlock,
+            (double)s.fragmentationRatio);
+        json += buf;
+    }
+    json += "]";
+    return json.c_str();
+#else
+    return "[]";
+#endif
+}
 #endif  // GGML_USE_HIP && GGML_HIP_VVM_POOL
 
 static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {

@@ -164,5 +164,7 @@ if (GGML_HIP_VVM_POOL)
         message(FATAL_ERROR "GGML_HIP_VVM_POOL requires the Vulkan SDK headers (VulkanVM public headers include them)")
     endif()
     target_link_libraries(ggml-hip PRIVATE ${VVM_LIBRARY})
-    target_compile_definitions(ggml-hip PRIVATE GGML_HIP_VVM_POOL)
+    # PUBLIC so consumers (e.g. llama-server's /vvm/stats endpoint) can gate
+    # on the backend being VVM-capable.
+    target_compile_definitions(ggml-hip PUBLIC GGML_HIP_VVM_POOL)
 endif()
