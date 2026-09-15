@@ -727,6 +727,13 @@ struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     std::string name;
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_VVM_POOL)
+    // Chonk Buffer pool: when set, dev_ptr belongs to a vvm::UnifiedMemoryPool
+    // allocation. Keeps the RAII handle alive until the last buffer reference
+    // dies; ~UniqueAllocation returns the memory to the pool. The context dtor
+    // must NOT cudaFree a pooled pointer.
+    std::shared_ptr<void> vvm_guard;
+#endif
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
         device(device), dev_ptr(dev_ptr),
@@ -734,6 +741,9 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_VVM_POOL)
+        if (vvm_guard) return;   // memory returns to the pool via the guard
+#endif
         CUDA_CHECK(cudaFree(dev_ptr));
     }
 };
@@ -880,10 +890,105 @@ static bool ggml_backend_buft_is_cuda(ggml_backend_buffer_type_t buft) {
     return buft->iface.get_name == ggml_backend_cuda_buffer_type_get_name;
 }
 
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_VVM_POOL)
+// ============================================================================
+// VVM (Chonk Buffer) pool integration for the HIP path.
+// Mirrors the ggml-vulkan VVM hook: route device-buffer allocations through a
+// vvm::UnifiedMemoryPool created over the HIP memory backend (mem_backend
+// seam). Enabled at build time (GGML_HIP_VVM_POOL) and runtime
+// (GGML_HIP_VVM_POOL=1). Fail-soft: any pool failure falls back to
+// ggml_cuda_device_malloc (hipMalloc).
+// ============================================================================
+#include "vulkan_vm/vulkan_vm.hpp"
+
+#include <memory>
+#include <mutex>
+
+static bool ggml_hip_vvm_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * env = getenv("GGML_HIP_VVM_POOL");
+        enabled = (env != nullptr && env[0] == '1') ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+struct ggml_hip_vvm_entry {
+    std::unique_ptr<vvm::UnifiedMemoryPool> pool;
+};
+static std::mutex g_hip_vvm_mtx;
+static ggml_hip_vvm_entry g_hip_vvm_pools[GGML_CUDA_MAX_DEVICES];
+
+static vvm::UnifiedMemoryPool * ggml_hip_vvm_get_pool(int device) {
+    std::lock_guard<std::mutex> lock(g_hip_vvm_mtx);
+    auto & entry = g_hip_vvm_pools[device];
+    if (entry.pool) {
+        return entry.pool.get();
+    }
+
+    vvm::DeviceConfig cfg;
+    cfg.backendDeviceIndex = device;
+
+    vvm::PoolConfig pcfg;
+    pcfg.blockSize = 1ull * 1024ull * 1024ull * 1024ull;   // 1 GiB blocks
+    pcfg.maxBlocks = 0;                                     // unlimited
+    pcfg.enableHostVisible = false;
+    // Chonk Chunks: buffer bases on 2 MB boundaries + small allocations
+    // routed to tiered chunk blocks (see the ggml-vulkan hook for the
+    // measured rationale).
+    pcfg.allocationAlignment = 2ull * 1024ull * 1024ull;
+    pcfg.chunkTiers = {
+        {  1ull * 1024ull * 1024ull,   8ull * 1024ull * 1024ull},
+        {  4ull * 1024ull * 1024ull,  32ull * 1024ull * 1024ull},
+        { 16ull * 1024ull * 1024ull,  64ull * 1024ull * 1024ull},
+        { 64ull * 1024ull * 1024ull, 256ull * 1024ull * 1024ull},
+    };
+
+    auto created = vvm::UnifiedMemoryPool::create(cfg, pcfg);
+    if (!created.has_value()) {
+        GGML_LOG_ERROR("ggml_cuda: failed to create VVM (Chonk Buffer) pool for HIP device %d\n", device);
+        return nullptr;
+    }
+    GGML_LOG_INFO("ggml_cuda: VVM Chonk Buffer pool created for HIP device %d\n", device);
+    entry.pool = std::make_unique<vvm::UnifiedMemoryPool>(std::move(*created));
+    return entry.pool.get();
+}
+#endif  // GGML_USE_HIP && GGML_HIP_VVM_POOL
+
 static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
 
     ggml_cuda_set_device(buft_ctx->device);
+
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_VVM_POOL)
+    if (ggml_hip_vvm_enabled()) {
+        try {
+            vvm::UnifiedMemoryPool * pool = ggml_hip_vvm_get_pool(buft_ctx->device);
+            if (pool != nullptr) {
+                vvm::AllocDesc desc;
+                desc.size = size;
+                desc.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                             VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                             VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                desc.memoryUsage = vvm::MemoryUsage::GpuOnly;
+                auto alloc = pool->allocate(desc);
+                if (alloc.has_value()) {
+                    // HIP backend: the device pointer IS the buffer.
+                    void * dev_ptr = reinterpret_cast<void *>(alloc->buffer);
+                    struct vvm_guard_obj { vvm::UniqueAllocation a; };
+                    auto guard = std::make_shared<vvm_guard_obj>(
+                        vvm_guard_obj{ vvm::UniqueAllocation::make(pool, std::move(*alloc)) });
+                    ggml_backend_cuda_buffer_context * ctx =
+                        new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
+                    ctx->vvm_guard = std::static_pointer_cast<void>(guard);
+                    return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+                }
+            }
+        } catch (const std::exception & e) {
+            GGML_LOG_WARN("ggml_cuda: VVM pool alloc failed for %zu bytes (%s); falling back to hipMalloc\n", size, e.what());
+        }
+    }
+#endif
 
     void * dev_ptr;
     cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);

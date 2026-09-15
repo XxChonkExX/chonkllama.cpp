@@ -4660,7 +4660,11 @@ void server_routes::init_routes() {
         auto res = create_response(true);
         res->content_type = "application/json";
         res->status = 200;
+#if defined(VVM_AUTO_PLACEMENT)
         const char * json = ggml_vulkan_vvm_stats_json();
+#else
+        const char * json = "[]";
+#endif
         res->data = std::string(json);
         return res;
     };

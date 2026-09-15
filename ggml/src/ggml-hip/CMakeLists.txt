@@ -142,3 +142,27 @@ if (GGML_HIP_RCCL)
 endif()
 
 target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas)
+
+# VVM (Chonk Buffer) pool integration: link against an external VulkanVM
+# build (vvm::UnifiedMemoryPool over the HIP memory backend) and route
+# tensor buffer allocations through it when GGML_HIP_VVM_POOL=1 is set at
+# runtime. Mirrors the ggml-vulkan VVM integration.
+option(GGML_HIP_VVM_POOL "Enable Chonk Buffer (VulkanVM UnifiedMemoryPool over HIP) integration" OFF)
+set(VVM_ROOT "" CACHE PATH "Path to VulkanVM repo (containing include/ and a built vulkan_vm.lib)")
+if (GGML_HIP_VVM_POOL)
+    if (NOT VVM_ROOT)
+        message(FATAL_ERROR "GGML_HIP_VVM_POOL requires VVM_ROOT pointing at the VulkanVM repo")
+    endif()
+    find_library(VVM_LIBRARY NAMES vulkan_vm PATHS "${VVM_ROOT}/build_infer" "${VVM_ROOT}/build" REQUIRED)
+    target_include_directories(ggml-hip PRIVATE "${VVM_ROOT}/include")
+    # VulkanVM's public headers include the Vulkan SDK headers; link the
+    # header-only target (no runtime dependency on a Vulkan loader).
+    find_package(Vulkan QUIET)
+    if (Vulkan_FOUND)
+        target_link_libraries(ggml-hip PRIVATE Vulkan::Headers)
+    else()
+        message(FATAL_ERROR "GGML_HIP_VVM_POOL requires the Vulkan SDK headers (VulkanVM public headers include them)")
+    endif()
+    target_link_libraries(ggml-hip PRIVATE ${VVM_LIBRARY})
+    target_compile_definitions(ggml-hip PRIVATE GGML_HIP_VVM_POOL)
+endif()

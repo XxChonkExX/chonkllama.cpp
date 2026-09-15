@@ -563,7 +563,9 @@ llama_model_loader::llama_model_loader(
     if (tensor_buft_overrides) {
         for (const auto * p = tensor_buft_overrides; p->pattern != nullptr; ++p) {
             if (p->buft == nullptr) {
+#if defined(VVM_AUTO_PLACEMENT)
                 ggml_vulkan_vvm_auto_begin();
+#endif
                 break;
             }
         }
@@ -1244,6 +1246,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 std::regex pattern(overrides->pattern);
                 if (std::regex_search(tensor_name, pattern)) {
                     if (overrides->buft == nullptr) {
+#if defined(VVM_AUTO_PLACEMENT)
                         // VVM auto placement: pick the Vulkan device with the
                         // most remaining free-VRAM budget for this tensor.
                         buft = ggml_vulkan_vvm_auto_pick(ggml_nbytes(t_meta));
@@ -1251,6 +1254,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                             // VVM unavailable - fall through to default placement.
                             break;
                         }
+#endif
                     } else if (overrides->buft == ggml_backend_cpu_buffer_type()) {
                         // when overriding to a CPU buffer, consider the extra buffer types
                         buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);

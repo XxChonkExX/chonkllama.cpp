@@ -50,6 +50,12 @@ add_library(llama
             ${LLAMA_MODELS_SOURCES}
             )
 
+# VVM auto-placement calls resolve to symbols in ggml-vulkan; gate them out
+# when that backend is not part of the build (e.g. HIP-only builds).
+if(TARGET ggml-vulkan)
+    target_compile_definitions(llama PUBLIC VVM_AUTO_PLACEMENT=1)
+endif()
+
 set_target_properties(llama PROPERTIES
     VERSION ${LLAMA_VERSION_BASE}
     SOVERSION ${LLAMA_VERSION_MAJOR}
