@@ -2,6 +2,9 @@
 
 #include "ggml-alloc.h"
 #include "ggml-vulkan.h"
+#if defined(VVM_AUTO_PLACEMENT_HIP)
+#include "ggml-cuda.h"
+#endif
 #include "ggml.h"
 #include "gguf.h"
 #include "llama-hparams.h"
@@ -563,6 +566,7 @@ llama_model_loader::llama_model_loader(
     // planner is available it additionally computes the full placement plan
     // from the model file's own tensor inventory (names+sizes), so expert
     // layers land per the measured policy with no hand-tuned --n-cpu-moe.
+    // The HIP build takes the same path through its own backend.
     if (tensor_buft_overrides) {
         for (const auto * p = tensor_buft_overrides; p->pattern != nullptr; ++p) {
             if (p->buft == nullptr) {
@@ -573,6 +577,10 @@ llama_model_loader::llama_model_loader(
                 // (A --vvm-auto-kv-mib flag can thread the real -c later.)
                 if (!fname.empty()) {
                     ggml_vulkan_vvm_auto_plan(fname.c_str(), 512ull * 1024ull * 1024ull);
+                }
+#elif defined(VVM_AUTO_PLACEMENT_HIP)
+                if (!fname.empty()) {
+                    ggml_hip_vvm_auto_plan(fname.c_str(), 512ull * 1024ull * 1024ull);
                 }
 #endif
                 break;
@@ -1262,6 +1270,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                         buft = ggml_vulkan_vvm_auto_pick_named(tensor_name.c_str(), ggml_nbytes(t_meta));
                         if (buft == nullptr) {
                             // VVM unavailable - fall through to default placement.
+                            break;
+                        }
+#elif defined(VVM_AUTO_PLACEMENT_HIP)
+                        // Same contract through the HIP backend.
+                        buft = ggml_hip_vvm_auto_pick_named(tensor_name.c_str(), ggml_nbytes(t_meta));
+                        if (buft == nullptr) {
                             break;
                         }
 #endif

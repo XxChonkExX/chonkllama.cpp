@@ -43,6 +43,12 @@ GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 // Chonk Buffer pool statistics (GGML_HIP_VVM_POOL builds): JSON array of
 // per-device pool states, same schema as ggml_vulkan_vvm_stats_json.
 GGML_BACKEND_API const char * ggml_hip_vvm_stats_json(void);
+// Planner path: compute the full auto-placement plan ONCE from the model
+// file's tensor inventory, then resolve per tensor by NAME. Falls back to
+// NULL (default placement) for tensors outside the plan.
+// kv_bytes: expected KV cache size (reserves dense-device headroom).
+GGML_BACKEND_API void ggml_hip_vvm_auto_plan(const char * model_path, uint64_t kv_bytes);
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_hip_vvm_auto_pick_named(const char * tensor_name, size_t nbytes);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 

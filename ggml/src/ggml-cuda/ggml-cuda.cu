@@ -971,6 +971,91 @@ static vvm::UnifiedMemoryPool * ggml_hip_vvm_get_pool(int device) {
     return entry.pool.get();
 }
 
+// Planner state: one PlacementPlan per model load, resolved per tensor name.
+// The pool mutex serializes the snapshot; buffer types resolve after.
+static vvm::PlacementPlan g_hip_vvm_plan;
+static bool g_hip_vvm_plan_ready = false;
+
+void ggml_hip_vvm_auto_plan(const char * model_path, uint64_t kv_bytes) {
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_VVM_POOL)
+    std::lock_guard<std::mutex> lock(g_hip_vvm_mtx);
+    g_hip_vvm_plan_ready = false;
+    if (!ggml_hip_vvm_enabled() || model_path == nullptr || model_path[0] == 0) {
+        return;
+    }
+    auto specs = vvm::read_gguf_inventory(model_path);
+    if (specs.empty()) {
+        GGML_LOG_WARN("ggml_cuda: VVM auto-plan: no inventory for %s\n", model_path);
+        return;
+    }
+    // Consumer filter: this binary serves HIP + CPU only. Vulkan/L0 entries
+    // describe GPUs this backend cannot place tensors on; the HIP-source
+    // entries are the same physical cards it serves.
+    auto devices = vvm::enumerate_all_devices();
+    std::vector<vvm::BackendDeviceInfo> mine;
+    for (auto & d : devices) {
+        if (d.source == vvm::DeviceSource::Hip) {
+            mine.push_back(d);
+        }
+    }
+    g_hip_vvm_plan = vvm::auto_place_experts(mine, specs, kv_bytes, 0.90f);
+    g_hip_vvm_plan_ready = true;
+    GGML_LOG_INFO("ggml_cuda: VVM auto-plan: %s\n", g_hip_vvm_plan.summary);
+#else
+    (void)model_path;
+    (void)kv_bytes;
+#endif
+}
+
+ggml_backend_buffer_type_t ggml_hip_vvm_auto_pick_named(const char * tensor_name, size_t nbytes) {
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_VVM_POOL)
+    if (!ggml_hip_vvm_enabled()) {
+        return nullptr;
+    }
+    // Snapshot the placement decision under the lock, resolve buffer types
+    // after (device setup is slow and must not run under the pool mutex).
+    bool havePlan = false;
+    vvm::TensorClass cls = vvm::TensorClass::Other;
+    vvm::ExpertPlacement ep{};
+    int32_t denseIdx = -1;
+    {
+        std::lock_guard<std::mutex> lock(g_hip_vvm_mtx);
+        if (g_hip_vvm_plan_ready && tensor_name != nullptr) {
+            havePlan = true;
+            int32_t layer = -1;
+            cls = vvm::classify_tensor(tensor_name, &layer);
+            if (cls == vvm::TensorClass::Expert && layer >= 0 &&
+                static_cast<size_t>(layer) < g_hip_vvm_plan.experts.size()) {
+                ep = g_hip_vvm_plan.experts[static_cast<size_t>(layer)];
+            }
+            denseIdx = g_hip_vvm_plan.denseDeviceIndex;
+        }
+    }
+    if (havePlan) {
+        if (cls == vvm::TensorClass::LookupTable) {
+            return ggml_backend_cpu_buffer_type();
+        }
+        if (cls == vvm::TensorClass::Expert) {
+            if (ep.onCpu || ep.deviceIndex < 0) {
+                return ggml_backend_cpu_buffer_type();
+            }
+            return ggml_backend_cuda_buffer_type(ep.deviceIndex);
+        }
+        // Dense/attention/head: the plan's dense device (HIP index here).
+        if (denseIdx < 0) {
+            return ggml_backend_cpu_buffer_type();
+        }
+        return ggml_backend_cuda_buffer_type(denseIdx);
+    }
+    (void)nbytes;
+    return nullptr;
+#else
+    (void)tensor_name;
+    (void)nbytes;
+    return nullptr;
+#endif
+}
+
 // Chonk Buffer pool statistics for HIP: same JSON schema as
 // ggml_vulkan_vvm_stats_json (per-device pool state for /vvm/stats).
 const char * ggml_hip_vvm_stats_json(void) {
