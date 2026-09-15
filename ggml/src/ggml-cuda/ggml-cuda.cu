@@ -940,6 +940,14 @@ static vvm::UnifiedMemoryPool * ggml_hip_vvm_get_pool(int device) {
             pcfg.blockSize = v;
         }
     }
+    // Spill-cliff protection (opt-in): GGML_VVM_HEAP_FRACTION in (0, 1],
+    // e.g. 0.90. The pool's wouldExceedBudget refuses growth past this
+    // fraction of the heap and failing allocations go native instead of
+    // silently over-committing into driver shared-memory spill.
+    if (const char* hf = getenv("GGML_VVM_HEAP_FRACTION")) {
+        float v = (float)atof(hf);
+        if (v > 0.0f && v <= 1.0f) pcfg.maxHeapFraction = v;
+    }
     pcfg.maxBlocks = 0;                                     // unlimited
     pcfg.enableHostVisible = false;
     // Chonk Chunks: buffer bases on 2 MB boundaries + small allocations
