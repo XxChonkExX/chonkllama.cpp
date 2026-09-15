@@ -931,6 +931,15 @@ static vvm::UnifiedMemoryPool * ggml_hip_vvm_get_pool(int device) {
 
     vvm::PoolConfig pcfg;
     pcfg.blockSize = 1ull * 1024ull * 1024ull * 1024ull;   // 1 GiB blocks
+    // Benchmark knob (mirrors the Vulkan hook): GGML_VVM_BLOCK_SIZE in
+    // bytes (256 KiB..8 GiB). At 2 GiB the ~1.05 GiB expert tensors
+    // sub-allocate instead of routing dedicated.
+    if (const char* bs = getenv("GGML_VVM_BLOCK_SIZE")) {
+        unsigned long long v = strtoull(bs, nullptr, 0);
+        if (v >= 256ull * 1024ull && v <= 8ull * 1024ull * 1024ull * 1024ull) {
+            pcfg.blockSize = v;
+        }
+    }
     pcfg.maxBlocks = 0;                                     // unlimited
     pcfg.enableHostVisible = false;
     // Chonk Chunks: buffer bases on 2 MB boundaries + small allocations
