@@ -144,6 +144,37 @@ inline void ggml_vvm_append_pool_json(std::string & json, bool & first,
 // GPUs the local listing also reports, so dropping them loses nothing.
 // ---------------------------------------------------------------------------
 
+// Planned KV hold: the planner accounts for the KV cache, but pools are
+// created lazily AFTER the plan and the KV allocates even later - without a
+// hold, expert tensors can consume the budget the KV needs (the 262K OOM
+// sequence). Stash the planned KV bytes at plan time; get_pool() calls
+// pool->reserve() right after create so the hold is enforced from the first
+// allocation. Each backend stores one hold per device.
+struct ggml_vvm_kv_hold {
+    uint64_t bytes = 0;
+    bool reserved = false;
+};
+
+// Reserve the planned KV once per pool (idempotent). Returns true when the
+// hold is in place; false = refused (plan over-committed: callers keep the
+// hold unreserved and the pool budget still protects late KV).
+inline bool ggml_vvm_reserve_kv(vvm::UnifiedMemoryPool * pool, ggml_vvm_kv_hold & hold,
+                                const char * log_tag, int device) {
+    if (pool == nullptr || hold.reserved || hold.bytes == 0) {
+        return hold.reserved;
+    }
+    if (!pool->reserve(hold.bytes)) {
+        GGML_LOG_WARN("%s: VVM KV hold of %llu MiB refused (plan over-commits); "
+                      "KV allocates best-effort\n",
+                      log_tag, (unsigned long long)(hold.bytes / 1024 / 1024));
+        return false;
+    }
+    hold.reserved = true;
+    GGML_LOG_INFO("%s: VVM KV hold %llu MiB reserved (device %d)\n",
+                  log_tag, (unsigned long long)(hold.bytes / 1024 / 1024), device);
+    return true;
+}
+
 inline bool ggml_vvm_compute_plan(vvm::DeviceSource source,
                                   const char * model_path, uint64_t kv_bytes,
                                   const char * log_tag, vvm::PlacementPlan & out) {

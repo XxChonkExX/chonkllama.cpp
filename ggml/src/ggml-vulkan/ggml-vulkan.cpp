@@ -3841,6 +3841,11 @@ static vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size);
 // pool via the device struct under this lock too).
 static std::mutex g_vvm_pools_mtx;
 
+// Planned KV budget (stash): set at auto-plan time, consumed at pool create
+// (ggml_vvm_reserve_kv). One hold for the process's Vulkan devices: all
+// Vulkan pools share the same planned KV reserve.
+static ggml_vvm_kv_hold g_vvm_kv_stash;
+
 // Auto-split placement state (--vvm-split pattern=auto): per-device remaining
 // byte budgets, snapshotted from free VRAM at load start and consumed as
 // tensors are assigned.
@@ -3911,6 +3916,10 @@ static vvm::UnifiedMemoryPool * ggml_vk_vvm_get_pool(vk_device & device) {
                   device->name.c_str());
 
     device->vvm_pool = std::make_unique<vvm::UnifiedMemoryPool>(std::move(*created));
+    // Enforce the planner's KV hold from the first allocation: without this,
+    // expert tensors can consume the budget the KV needs (the 262K OOM).
+    ggml_vvm_reserve_kv(device->vvm_pool.get(), g_vvm_kv_stash, "ggml_vulkan",
+                        (int)device->index);
     return device->vvm_pool.get();
 }
 
@@ -4121,6 +4130,10 @@ void ggml_vulkan_vvm_auto_plan(const char * model_path, uint64_t kv_bytes) {
     }
     // Consumer filter lives inside: only Vulkan-source devices (the cards
     // this binary can place tensors on) reach the planner.
+    // Stash the KV budget BEFORE computing: pools are created lazily and
+    // reserve fires at pool create.
+    g_vvm_kv_stash.bytes = kv_bytes;
+    g_vvm_kv_stash.reserved = false;
     g_vvm_plan_ready = ggml_vvm_compute_plan(
         vvm::DeviceSource::Vulkan, model_path, kv_bytes,
         "ggml_vulkan", g_vvm_plan);

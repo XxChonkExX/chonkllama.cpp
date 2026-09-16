@@ -915,6 +915,7 @@ static bool ggml_hip_vvm_enabled() {
 
 struct ggml_hip_vvm_entry {
     std::unique_ptr<vvm::UnifiedMemoryPool> pool;
+    ggml_vvm_kv_hold kv;   // planned KV budget, reserved at pool create
 };
 static std::mutex g_hip_vvm_mtx;
 static ggml_hip_vvm_entry g_hip_vvm_pools[GGML_CUDA_MAX_DEVICES];
@@ -943,6 +944,9 @@ static vvm::UnifiedMemoryPool * ggml_hip_vvm_get_pool(int device) {
     }
     GGML_LOG_INFO("ggml_cuda: VVM Chonk Buffer pool created for HIP device %d\n", device);
     entry.pool = std::make_unique<vvm::UnifiedMemoryPool>(std::move(*created));
+    // Enforce the planner's KV hold from the first allocation: without this,
+    // expert tensors can consume the budget the KV needs (the 262K OOM).
+    ggml_vvm_reserve_kv(entry.pool.get(), entry.kv, "ggml_cuda", device);
     return entry.pool.get();
 }
 
@@ -960,6 +964,12 @@ void ggml_hip_vvm_auto_plan(const char * model_path, uint64_t kv_bytes) {
     }
     // Consumer filter lives inside: only HIP-source devices (the cards this
     // binary can place tensors on) reach the planner.
+    // Stash the KV budget for per-device holds BEFORE computing: pools are
+    // created lazily and reserve fires in get_pool.
+    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; d++) {
+        g_hip_vvm_pools[d].kv.bytes = kv_bytes;
+        g_hip_vvm_pools[d].kv.reserved = false;
+    }
     g_hip_vvm_plan_ready = ggml_vvm_compute_plan(
         vvm::DeviceSource::Hip, model_path, kv_bytes,
         "ggml_cuda", g_hip_vvm_plan);
