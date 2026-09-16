@@ -1,5 +1,56 @@
 # llama.cpp
 
+> ## 🍖 Chonk Buffer branch (`chonk-buffer`)
+>
+> This branch integrates **llama.cpp with the [VulkanVM Chonk Buffer](https://github.com/XxChonkExX/Vulkan-Automaton-VM)** —
+> a unified, cross-vendor GPU memory pool + allocator family (Vulkan / HIP / Level Zero
+> behind one `IDeviceMemoryBackend` seam). Tensor buffers route through
+> `vvm::UnifiedMemoryPool` instead of raw driver allocations, and the
+> **auto-placement planner** (`--vvm-split ...=auto`) puts each tensor class
+> where it runs fastest — no hand-tuning `--n-cpu-moe` sweeps.
+>
+> **Measured (single RX 7900 XTX, Qwen3.8-Flash-Next 90 GB): 19.86 t/s decode.**
+>
+> | Backend | What the integration does |
+> |---|---|
+> | Vulkan (`GGML_VK_VVM_POOL`) | ggml-vulkan tensor buffers via the Chonk pool (`GGML_VK_VVM_POOL=1`) |
+> | HIP (`GGML_HIP_VVM_POOL`) | ggml-hip tensor buffers via a HIP-backed Chonk pool (`GGML_HIP_VVM_POOL=1`) |
+> | Planner | `--vvm-split 'ffn_.*_exps.=auto,per_layer_token_embd=CPU'` rediscovers optimal MoE placement from the model file |
+> | Knobs | `GGML_VVM_HEAP_FRACTION` (pool VRAM cap), `GGML_VVM_BLOCK_SIZE`, `--vvm-auto-kv-mib` (KV budget for the planner) |
+>
+> **Build (Linux + ROCm, verified):**
+> ```bash
+> # 1. Build VulkanVM first (provides build_infer/libvulkan_vm.so)
+> cd /path/to/Vulkan-Automaton-VM
+> cmake -S . -B build_native -DCMAKE_BUILD_TYPE=Release && cmake --build build_native -j$(nproc)
+> ln -sfn build_native build_infer
+>
+> # 2. Build this branch (gfx1100 = RDNA3; modern HIP-language config)
+> cmake -S . -B build-hip -DCMAKE_BUILD_TYPE=Release -DGGML_HIP=ON \
+>   -DGPU_TARGETS=gfx1100 -DCMAKE_HIP_ARCHITECTURES=gfx1100 \
+>   -DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/clang \
+>   -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++ \
+>   -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ \
+>   -DCMAKE_PREFIX_PATH=/opt/rocm \
+>   -DGGML_HIP_VVM_POOL=ON -DVVM_ROOT=/path/to/Vulkan-Automaton-VM \
+>   -DLLAMA_CURL=OFF -DLLAMA_SERVER_WEBUI=OFF
+> cmake --build build-hip --target llama-server -j$(nproc)
+> ```
+> Requires: ROCm 7.x, Vulkan SDK headers (the pool's public headers include
+> them). If ROCm's bundled linker complains about `libxml2.so.2` on newer
+> Ubuntu: `sudo ln -sf /usr/lib/x86_64-linux-gnu/libxml2.so.16 /usr/lib/x86_64-linux-gnu/libxml2.so.2`.
+>
+> **Serve (example, 24 GB card):**
+> ```bash
+> HIP_VISIBLE_DEVICES=0 GGML_HIP_VVM_POOL=1 GGML_VVM_HEAP_FRACTION=0.80 \
+>   ./build-hip/bin/llama-server -m model-00001-of-00003.gguf \
+>     --n-cpu-moe 34 --vvm-split 'per_layer_token_embd=CPU' -c 4096
+> ```
+> All Chonk integration details, benchmarks, and the auto-placement design
+> live in the main repo: [docs/inference_benchmarks.md](https://github.com/XxChonkExX/Vulkan-Automaton-VM/blob/main/docs/inference_benchmarks.md).
+
+---
+
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">
