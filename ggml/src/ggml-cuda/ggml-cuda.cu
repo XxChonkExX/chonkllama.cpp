@@ -900,6 +900,7 @@ static bool ggml_backend_buft_is_cuda(ggml_backend_buffer_type_t buft) {
 // ggml_cuda_device_malloc (hipMalloc).
 // ============================================================================
 #include "vulkan_vm/vulkan_vm.hpp"
+#include "ggml-vvm-common.h"
 
 #include <memory>
 #include <mutex>
@@ -907,8 +908,7 @@ static bool ggml_backend_buft_is_cuda(ggml_backend_buffer_type_t buft) {
 static bool ggml_hip_vvm_enabled() {
     static int enabled = -1;
     if (enabled == -1) {
-        const char * env = getenv("GGML_HIP_VVM_POOL");
-        enabled = (env != nullptr && env[0] == '1') ? 1 : 0;
+        enabled = ggml_vvm_env_on("GGML_HIP_VVM_POOL") ? 1 : 0;
     }
     return enabled == 1;
 }
@@ -930,36 +930,11 @@ static vvm::UnifiedMemoryPool * ggml_hip_vvm_get_pool(int device) {
     cfg.backendDeviceIndex = device;
 
     vvm::PoolConfig pcfg;
-    pcfg.blockSize = 1ull * 1024ull * 1024ull * 1024ull;   // 1 GiB blocks
-    // Benchmark knob (mirrors the Vulkan hook): GGML_VVM_BLOCK_SIZE in
-    // bytes (256 KiB..8 GiB). At 2 GiB the ~1.05 GiB expert tensors
-    // sub-allocate instead of routing dedicated.
-    if (const char* bs = getenv("GGML_VVM_BLOCK_SIZE")) {
-        unsigned long long v = strtoull(bs, nullptr, 0);
-        if (v >= 256ull * 1024ull && v <= 8ull * 1024ull * 1024ull * 1024ull) {
-            pcfg.blockSize = v;
-        }
-    }
-    // Spill-cliff protection (opt-in): GGML_VVM_HEAP_FRACTION in (0, 1],
-    // e.g. 0.90. The pool's wouldExceedBudget refuses growth past this
-    // fraction of the heap and failing allocations go native instead of
-    // silently over-committing into driver shared-memory spill.
-    if (const char* hf = getenv("GGML_VVM_HEAP_FRACTION")) {
-        float v = (float)atof(hf);
-        if (v > 0.0f && v <= 1.0f) pcfg.maxHeapFraction = v;
-    }
-    pcfg.maxBlocks = 0;                                     // unlimited
-    pcfg.enableHostVisible = false;
-    // Chonk Chunks: buffer bases on 2 MB boundaries + small allocations
-    // routed to tiered chunk blocks (see the ggml-vulkan hook for the
-    // measured rationale).
-    pcfg.allocationAlignment = 2ull * 1024ull * 1024ull;
-    pcfg.chunkTiers = {
-        {  1ull * 1024ull * 1024ull,   8ull * 1024ull * 1024ull},
-        {  4ull * 1024ull * 1024ull,  32ull * 1024ull * 1024ull},
-        { 16ull * 1024ull * 1024ull,  64ull * 1024ull * 1024ull},
-        { 64ull * 1024ull * 1024ull, 256ull * 1024ull * 1024ull},
-    };
+    // Shared pool policy (env knobs, chunk ladder, budget): see
+    // ggml-vvm-common.h. HIP takes no device-derived fields: device
+    // addresses are plain pointers here, and there is no memory-priority
+    // extension to chain.
+    ggml_vvm_default_pool_config(pcfg, false, 0.0f, "ggml_cuda");
 
     auto created = vvm::UnifiedMemoryPool::create(cfg, pcfg);
     if (!created.has_value()) {
@@ -980,34 +955,14 @@ void ggml_hip_vvm_auto_plan(const char * model_path, uint64_t kv_bytes) {
 #if defined(GGML_USE_HIP) && defined(GGML_HIP_VVM_POOL)
     std::lock_guard<std::mutex> lock(g_hip_vvm_mtx);
     g_hip_vvm_plan_ready = false;
-    if (!ggml_hip_vvm_enabled() || model_path == nullptr || model_path[0] == 0) {
+    if (!ggml_hip_vvm_enabled()) {
         return;
     }
-    auto specs = vvm::read_gguf_inventory(model_path);
-    if (specs.empty()) {
-        GGML_LOG_WARN("ggml_cuda: VVM auto-plan: no inventory for %s\n", model_path);
-        return;
-    }
-    // Consumer filter: this binary serves HIP + CPU only. Vulkan/L0 entries
-    // describe GPUs this backend cannot place tensors on; the HIP-source
-    // entries are the same physical cards it serves.
-    auto devices = vvm::enumerate_all_devices();
-    std::vector<vvm::BackendDeviceInfo> mine;
-    for (auto & d : devices) {
-        if (d.source == vvm::DeviceSource::Hip) {
-            mine.push_back(d);
-        }
-    }
-    // Heap fraction shared with the pool cap (GGML_VVM_HEAP_FRACTION):
-    // the plan must budget against the same ceiling the pool enforces.
-    float planFrac = 0.90f;
-    if (const char* hf = getenv("GGML_VVM_HEAP_FRACTION")) {
-        float v = (float)atof(hf);
-        if (v > 0.0f && v <= 1.0f) planFrac = v;
-    }
-    g_hip_vvm_plan = vvm::auto_place_experts(mine, specs, kv_bytes, planFrac);
-    g_hip_vvm_plan_ready = true;
-    GGML_LOG_INFO("ggml_cuda: VVM auto-plan: %s\n", g_hip_vvm_plan.summary);
+    // Consumer filter lives inside: only HIP-source devices (the cards this
+    // binary can place tensors on) reach the planner.
+    g_hip_vvm_plan_ready = ggml_vvm_compute_plan(
+        vvm::DeviceSource::Hip, model_path, kv_bytes,
+        "ggml_cuda", g_hip_vvm_plan);
 #else
     (void)model_path;
     (void)kv_bytes;
@@ -1022,37 +977,19 @@ ggml_backend_buffer_type_t ggml_hip_vvm_auto_pick_named(const char * tensor_name
     // Snapshot the placement decision under the lock, resolve buffer types
     // after (device setup is slow and must not run under the pool mutex).
     bool havePlan = false;
-    vvm::TensorClass cls = vvm::TensorClass::Other;
-    vvm::ExpertPlacement ep{};
-    int32_t denseIdx = -1;
+    ggml_vvm_pick pick{};
     {
         std::lock_guard<std::mutex> lock(g_hip_vvm_mtx);
-        if (g_hip_vvm_plan_ready && tensor_name != nullptr) {
-            havePlan = true;
-            int32_t layer = -1;
-            cls = vvm::classify_tensor(tensor_name, &layer);
-            if (cls == vvm::TensorClass::Expert && layer >= 0 &&
-                static_cast<size_t>(layer) < g_hip_vvm_plan.experts.size()) {
-                ep = g_hip_vvm_plan.experts[static_cast<size_t>(layer)];
-            }
-            denseIdx = g_hip_vvm_plan.denseDeviceIndex;
+        if (g_hip_vvm_plan_ready) {
+            pick = ggml_vvm_pick_from_plan(g_hip_vvm_plan, tensor_name);
+            havePlan = pick.have_plan;
         }
     }
     if (havePlan) {
-        if (cls == vvm::TensorClass::LookupTable) {
+        if (pick.want_cpu) {
             return ggml_backend_cpu_buffer_type();
         }
-        if (cls == vvm::TensorClass::Expert) {
-            if (ep.onCpu || ep.deviceIndex < 0) {
-                return ggml_backend_cpu_buffer_type();
-            }
-            return ggml_backend_cuda_buffer_type(ep.deviceIndex);
-        }
-        // Dense/attention/head: the plan's dense device (HIP index here).
-        if (denseIdx < 0) {
-            return ggml_backend_cpu_buffer_type();
-        }
-        return ggml_backend_cuda_buffer_type(denseIdx);
+        return ggml_backend_cuda_buffer_type(pick.device_index);
     }
     (void)nbytes;
     return nullptr;
@@ -1075,27 +1012,16 @@ const char * ggml_hip_vvm_stats_json(void) {
     std::lock_guard<std::mutex> lock(g_hip_vvm_mtx);
     json = "[";
     bool first = true;
-    char buf[512];
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; i++) {
         auto & entry = g_hip_vvm_pools[i];
         if (!entry.pool) {
             continue;
         }
         const vvm::PoolStats s = entry.pool->getStats();
-        if (!first) json += ",";
-        first = false;
-        snprintf(buf, sizeof(buf),
-            "{\"device\":\"%s%d\",\"blockSize\":%llu,\"blocks\":%u,"
-            "\"allocations\":%u,\"dedicated\":%u,"
-            "\"capacityBytes\":%llu,\"usedBytes\":%llu,\"freeBytes\":%llu,"
-            "\"largestFreeBytes\":%llu,\"fragmentation\":%.3f}",
-            GGML_CUDA_NAME, i,
-            (unsigned long long)(entry.pool->getConfig().blockSize),
-            s.blockCount, s.allocationCount, s.dedicatedCount,
-            (unsigned long long)s.totalCapacity, (unsigned long long)s.totalUsed,
-            (unsigned long long)s.totalFree, (unsigned long long)s.largestFreeBlock,
-            (double)s.fragmentationRatio);
-        json += buf;
+        char name[32];
+        snprintf(name, sizeof(name), "%s%d", GGML_CUDA_NAME, i);
+        ggml_vvm_append_pool_json(json, first, name,
+                                  entry.pool->getConfig(), s);
     }
     json += "]";
     return json.c_str();

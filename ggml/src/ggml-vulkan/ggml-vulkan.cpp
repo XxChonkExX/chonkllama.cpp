@@ -3823,6 +3823,7 @@ static vk_buffer ggml_vk_create_buffer_check(vk_device& device, size_t size, vk:
 static vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size);
 
 #include "vulkan_vm/vulkan_vm.hpp"
+#include "ggml-vvm-common.h"
 
 #include <cstdlib>
 #include <mutex>
@@ -3854,8 +3855,7 @@ static bool g_vvm_auto_started = false;
 static bool ggml_vk_vvm_enabled() {
     static int enabled = -1;
     if (enabled == -1) {
-        const char * env = getenv("GGML_VK_VVM_POOL");
-        enabled = (env != nullptr && env[0] == '1') ? 1 : 0;
+        enabled = ggml_vvm_env_on("GGML_VK_VVM_POOL") ? 1 : 0;
     }
     return enabled == 1;
 }
@@ -3886,86 +3886,17 @@ static vvm::UnifiedMemoryPool * ggml_vk_vvm_get_pool(vk_device & device) {
         cfg.transferQueue = cfg.computeQueue;
     }
 
-    // Large contiguous blocks, no artificial caps: budget checks disabled by
-    // default in PoolConfig; unlimited block count so the pool can grow to the
-    // full heap as ggml requests memory.
+    // Shared pool policy (env knobs, chunk ladder, budget): see
+    // ggml-vvm-common.h. Device-derived fields come from this device:
+    // SHADER_DEVICE_ADDRESS usage + DEVICE_ADDRESS allocate flag match
+    // ggml-vulkan's own buffer creation exactly (measured -7% decode on
+    // RDNA3 without it); max memory priority matches ggml-vulkan's own
+    // allocation priority (avoids driver degrading blocks under pressure).
     vvm::PoolConfig pcfg;
-    pcfg.blockSize = 1ull * 1024ull * 1024ull * 1024ull;  // 1 GiB blocks (match ggml suballocation size)
-    pcfg.maxBlocks = 0;                                   // unlimited
-    pcfg.enableHostVisible = false;                       // offload tiers: Phase 3
-    pcfg.enableExternal = false;                          // cross-GPU import: Phase 2
-    // Match ggml-vulkan's own buffer creation exactly: when the device has
-    // bufferDeviceAddress enabled, pool buffers must also carry
-    // SHADER_DEVICE_ADDRESS usage + the DEVICE_ADDRESS allocate flag, or the
-    // driver places/maps them differently (measured -7% decode on RDNA3).
-    pcfg.enableDeviceAddress = device->buffer_device_address;
-    // Match ggml-vulkan's own allocation priority: without VK_EXT_memory_priority
-    // at max priority the driver degrades/evicts blocks as the heap fills,
-    // silently turning VRAM into PCIe-bound memory. (Only chained when the
-    // extension is enabled - GGML_VK_ENABLE_MEMORY_PRIORITY.)
-    pcfg.memoryPriority = device->memory_priority ? 1.0f : 0.0f;
-    // VRAM budget (VRAM_OVERFLOW_FINDINGS.md): measured on RDNA3+Arc, legit
-    // dual-GPU splits commit 92-98% of per-GPU heap, so a hard fraction cap
-    // breaks valid workloads (0.95/0.97/0.98 all tested - the 40B@256K q8
-    // split needs ~97% on the XTX). The pool WARNS at >90% heap commitment
-    // and fails soft via vkAllocateMemory OOM past 100% (the spill cliff is
-    // above 100% anyway). Opt in to a hard cap via GGML_VK_VVM_HEAP_FRACTION
-    // (e.g. 0.90) ONLY if you prefer load-failure over spill on your box.
-    if (const char* hf = getenv("GGML_VK_VVM_HEAP_FRACTION")) {
-        float v = (float)atof(hf);
-        if (v > 0.0f && v <= 1.0f) pcfg.maxHeapFraction = v;
-    }
-
-    // Experiment knobs (benchmarking matrix):
-    //   GGML_VVM_BLOCK_SIZE  = block size in bytes (default 1 GiB)
-    //   GGML_VVM_PURE_LOCAL  = 0 -> allow ReBAR (host-visible) VRAM types.
-    //   Default is PURE DEVICE_LOCAL: on Intel Arc the ReBAR-mapped pool
-    //   blocks lost ~3x decode bandwidth; pure local matches ggml parity.
-    if (const char* bs = getenv("GGML_VVM_BLOCK_SIZE")) {
-        unsigned long long v = strtoull(bs, nullptr, 0);
-        if (v >= 256ull * 1024ull && v <= 8ull * 1024ull * 1024ull * 1024ull) {
-            pcfg.blockSize = v;   // == minAlignment -> every request goes dedicated (pass-through mode)
-        } else if (v != 0) {
-            GGML_LOG_WARN("ggml_vulkan: ignoring out-of-range GGML_VVM_BLOCK_SIZE=%llu (256 KiB..8 GiB)\n", v);
-        }
-    }
-    pcfg.preferPureDeviceLocal = true;
-    if (const char* pl = getenv("GGML_VVM_PURE_LOCAL")) {
-        if (pl[0] == '0') {
-            pcfg.preferPureDeviceLocal = false;
-        }
-    }
-    if (const char* nd = getenv("GGML_VVM_NO_DEDICATED")) {
-        if (nd[0] == '1') {
-            pcfg.dedicatedAllocateInfo = false;
-        }
-    }
-    // Chonk Chunks: buffer bases on 2 MB driver-page boundaries + small
-    // allocations routed to tiered chunk blocks instead of claiming 1 GiB.
-    // Tiers cover the observed serve-path small range (5/7 MB scratch,
-    // 41/58 MB context buffers); 180 MB+ stay on buddy blocks.
-    pcfg.allocationAlignment = 2ull * 1024ull * 1024ull;
-    pcfg.chunkTiers = {
-        {  1ull * 1024ull * 1024ull,   8ull * 1024ull * 1024ull},
-        {  4ull * 1024ull * 1024ull,  32ull * 1024ull * 1024ull},
-        { 16ull * 1024ull * 1024ull,  64ull * 1024ull * 1024ull},
-        { 64ull * 1024ull * 1024ull, 256ull * 1024ull * 1024ull},
-    };
-    if (const char* ba = getenv("GGML_VVM_BASE_ALIGN")) {
-        unsigned long long v = strtoull(ba, nullptr, 0);
-        pcfg.allocationAlignment = v;   // 0 disables (falls back to minAlignment)
-    }
-    if (const char* cm = getenv("GGML_VVM_CHUNK_MB")) {
-        unsigned long long v = strtoull(cm, nullptr, 0);
-        if (v == 0) {
-            pcfg.smallAllocThreshold = 0;   // disable chunk routing
-            pcfg.chunkBlockSize = 0;
-            pcfg.chunkTiers.clear();
-        } else {
-            pcfg.chunkBlockSize = v * 1024ull * 1024ull;
-        }
-    }
-
+    ggml_vvm_default_pool_config(pcfg,
+        device->buffer_device_address,
+        device->memory_priority ? 1.0f : 0.0f,
+        "ggml_vulkan");
     auto created = vvm::UnifiedMemoryPool::create(cfg, pcfg);
     if (!created.has_value()) {
         char msg[512];
@@ -4091,27 +4022,14 @@ const char * ggml_vulkan_vvm_stats_json(void) {
     std::lock_guard<std::mutex> lock(g_vvm_pools_mtx);
     json = "[";
     bool first = true;
-    char buf[512];
     for (size_t i = 0; i < GGML_VK_MAX_DEVICES; i++) {
         vk_device dev = vk_instance.devices[i];
         if (dev == nullptr || !dev->vvm_pool) {
             continue;
         }
         const vvm::PoolStats s = dev->vvm_pool->getStats();
-        if (!first) json += ",";
-        first = false;
-        snprintf(buf, sizeof(buf),
-            "{\"device\":\"%s\",\"blockSize\":%llu,\"blocks\":%u,"
-            "\"allocations\":%u,\"dedicated\":%u,"
-            "\"capacityBytes\":%llu,\"usedBytes\":%llu,\"freeBytes\":%llu,"
-            "\"largestFreeBytes\":%llu,\"fragmentation\":%.3f}",
-            dev->name.c_str(),
-            (unsigned long long)(dev->vvm_pool->getConfig().blockSize),
-            s.blockCount, s.allocationCount, s.dedicatedCount,
-            (unsigned long long)s.totalCapacity, (unsigned long long)s.totalUsed,
-            (unsigned long long)s.totalFree, (unsigned long long)s.largestFreeBlock,
-            (double)s.fragmentationRatio);
-        json += buf;
+        ggml_vvm_append_pool_json(json, first, dev->name.c_str(),
+                                  dev->vvm_pool->getConfig(), s);
     }
     json += "]";
     return json.c_str();
@@ -4198,34 +4116,14 @@ void ggml_vulkan_vvm_auto_plan(const char * model_path, uint64_t kv_bytes) {
 #if defined(GGML_VK_VVM_POOL)
     std::lock_guard<std::mutex> lock(g_vvm_pools_mtx);
     g_vvm_plan_ready = false;
-    if (!ggml_vk_vvm_enabled() || model_path == nullptr || model_path[0] == 0) {
+    if (!ggml_vk_vvm_enabled()) {
         return;
     }
-    auto specs = vvm::read_gguf_inventory(model_path);
-    if (specs.empty()) {
-        GGML_LOG_WARN("ggml_vulkan: VVM auto-plan: no inventory for %s, budget fallback\n", model_path);
-        return;
-    }
-    // Consumer filter: this binary serves Vulkan + CPU only. HIP/Level0
-    // entries describe the same physical GPUs the transient Vulkan listing
-    // also reports, so dropping them loses nothing here.
-    auto devices = vvm::enumerate_all_devices();
-    std::vector<vvm::BackendDeviceInfo> mine;
-    for (auto & d : devices) {
-        if (d.source == vvm::DeviceSource::Vulkan) {
-            mine.push_back(d);
-        }
-    }
-    // Heap fraction shared with the pool cap (GGML_VVM_HEAP_FRACTION):
-    // the plan must budget against the same ceiling the pool enforces.
-    float planFrac = 0.90f;
-    if (const char* hf = getenv("GGML_VVM_HEAP_FRACTION")) {
-        float v = (float)atof(hf);
-        if (v > 0.0f && v <= 1.0f) planFrac = v;
-    }
-    g_vvm_plan = vvm::auto_place_experts(mine, specs, kv_bytes, planFrac);
-    g_vvm_plan_ready = true;
-    GGML_LOG_INFO("ggml_vulkan: VVM auto-plan: %s\n", g_vvm_plan.summary);
+    // Consumer filter lives inside: only Vulkan-source devices (the cards
+    // this binary can place tensors on) reach the planner.
+    g_vvm_plan_ready = ggml_vvm_compute_plan(
+        vvm::DeviceSource::Vulkan, model_path, kv_bytes,
+        "ggml_vulkan", g_vvm_plan);
 #else
     UNUSED(model_path);
     UNUSED(kv_bytes);
@@ -4237,37 +4135,19 @@ ggml_backend_buffer_type_t ggml_vulkan_vvm_auto_pick_named(const char * tensor_n
     // Snapshot the placement decision under the lock, resolve buffer types
     // after (device creation is slow and must not run under the pool mutex).
     bool havePlan = false;
-    vvm::TensorClass cls = vvm::TensorClass::Other;
-    vvm::ExpertPlacement ep{};
-    int32_t denseIdx = -1;
+    ggml_vvm_pick pick{};
     {
         std::lock_guard<std::mutex> lock(g_vvm_pools_mtx);
-        if (g_vvm_plan_ready && tensor_name != nullptr) {
-            havePlan = true;
-            int32_t layer = -1;
-            cls = vvm::classify_tensor(tensor_name, &layer);
-            if (cls == vvm::TensorClass::Expert && layer >= 0 &&
-                static_cast<size_t>(layer) < g_vvm_plan.experts.size()) {
-                ep = g_vvm_plan.experts[static_cast<size_t>(layer)];
-            }
-            denseIdx = g_vvm_plan.denseDeviceIndex;
+        if (g_vvm_plan_ready) {
+            pick = ggml_vvm_pick_from_plan(g_vvm_plan, tensor_name);
+            havePlan = pick.have_plan;
         }
     }
     if (havePlan) {
-        if (cls == vvm::TensorClass::LookupTable) {
+        if (pick.want_cpu) {
             return ggml_backend_cpu_buffer_type();
         }
-        if (cls == vvm::TensorClass::Expert) {
-            if (ep.onCpu || ep.deviceIndex < 0) {
-                return ggml_backend_cpu_buffer_type();
-            }
-            return ggml_backend_vk_buffer_type((size_t)ep.deviceIndex);
-        }
-        // Dense/attention/head: the plan's dense device (Vulkan index here).
-        if (denseIdx < 0) {
-            return ggml_backend_cpu_buffer_type();
-        }
-        return ggml_backend_vk_buffer_type((size_t)denseIdx);
+        return ggml_backend_vk_buffer_type((size_t)pick.device_index);
     }
     return ggml_vulkan_vvm_auto_pick(nbytes);
 #else
