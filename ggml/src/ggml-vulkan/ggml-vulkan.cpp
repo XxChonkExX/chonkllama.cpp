@@ -4216,7 +4216,14 @@ void ggml_vulkan_vvm_auto_plan(const char * model_path, uint64_t kv_bytes) {
             mine.push_back(d);
         }
     }
-    g_vvm_plan = vvm::auto_place_experts(mine, specs, kv_bytes, 0.90f);
+    // Heap fraction shared with the pool cap (GGML_VVM_HEAP_FRACTION):
+    // the plan must budget against the same ceiling the pool enforces.
+    float planFrac = 0.90f;
+    if (const char* hf = getenv("GGML_VVM_HEAP_FRACTION")) {
+        float v = (float)atof(hf);
+        if (v > 0.0f && v <= 1.0f) planFrac = v;
+    }
+    g_vvm_plan = vvm::auto_place_experts(mine, specs, kv_bytes, planFrac);
     g_vvm_plan_ready = true;
     GGML_LOG_INFO("ggml_vulkan: VVM auto-plan: %s\n", g_vvm_plan.summary);
 #else

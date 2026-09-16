@@ -576,11 +576,23 @@ llama_model_loader::llama_model_loader(
                 // philosophy; the plan reserves it on the dense device.
                 // (A --vvm-auto-kv-mib flag can thread the real -c later.)
                 if (!fname.empty()) {
-                    ggml_vulkan_vvm_auto_plan(fname.c_str(), 512ull * 1024ull * 1024ull);
+                    // Real KV budget: VVM_AUTO_KV_MIB (MiB) or the 512 MiB
+                    // placeholder for small contexts.
+                    uint64_t kvMiB = 512;
+                    if (const char* ke = getenv("VVM_AUTO_KV_MIB")) {
+                        unsigned long long kv = strtoull(ke, nullptr, 0);
+                        if (kv > 0 && kv < 1048576ull) kvMiB = kv;
+                    }
+                    ggml_vulkan_vvm_auto_plan(fname.c_str(), kvMiB * 1024ull * 1024ull);
                 }
 #elif defined(VVM_AUTO_PLACEMENT_HIP)
                 if (!fname.empty()) {
-                    ggml_hip_vvm_auto_plan(fname.c_str(), 512ull * 1024ull * 1024ull);
+                    uint64_t kvMiB = 512;
+                    if (const char* ke = getenv("VVM_AUTO_KV_MIB")) {
+                        unsigned long long kv = strtoull(ke, nullptr, 0);
+                        if (kv > 0 && kv < 1048576ull) kvMiB = kv;
+                    }
+                    ggml_hip_vvm_auto_plan(fname.c_str(), kvMiB * 1024ull * 1024ull);
                 }
 #endif
                 break;

@@ -2804,6 +2804,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_VVM_SPLIT"));
     add_opt(common_arg(
+        {"--vvm-auto-kv-mib"}, "N",
+        "VVM auto-placement: assume N MiB of KV cache when budgeting GPU "
+        "expert layers (default: 512; set ~6144 for 262K contexts on this "
+        "model so the plan reserves the real KV).",
+        [](common_params & params, const std::string & value) {
+            (void)params;
+            ::setenv("VVM_AUTO_KV_MIB", value.c_str(), 1);
+        }
+    ).set_env("LLAMA_ARG_VVM_AUTO_KV_MIB"));
+    add_opt(common_arg(
         {"-cmoe", "--cpu-moe"},
         "keep all Mixture of Experts (MoE) weights in the CPU",
         [](common_params & params) {
