@@ -2810,7 +2810,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "model so the plan reserves the real KV).",
         [](common_params & params, const std::string & value) {
             (void)params;
-            ::setenv("VVM_AUTO_KV_MIB", value.c_str(), 1);
+            common_set_env("VVM_AUTO_KV_MIB", value.c_str());
         }
     ).set_env("LLAMA_ARG_VVM_AUTO_KV_MIB"));
     add_opt(common_arg(
