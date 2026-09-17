@@ -45,8 +45,10 @@ GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 GGML_BACKEND_API const char * ggml_hip_vvm_stats_json(void);
 // Planner path: compute the full auto-placement plan ONCE from the model
 // file's tensor inventory, then resolve per tensor by NAME. Falls back to
-// NULL (default placement) for tensors outside the plan.
+// NULL (default placement) for tensors outside the plan - note this differs
+// from the Vulkan pick_named, which falls back to budget-based auto_pick.
 // kv_bytes: expected KV cache size (reserves dense-device headroom).
+// Returned buffer-type pointers are valid until backend shutdown.
 GGML_BACKEND_API void ggml_hip_vvm_auto_plan(const char * model_path, uint64_t kv_bytes);
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_hip_vvm_auto_pick_named(const char * tensor_name, size_t nbytes);
 
