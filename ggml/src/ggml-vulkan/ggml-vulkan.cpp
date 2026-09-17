@@ -3919,7 +3919,7 @@ static vvm::UnifiedMemoryPool * ggml_vk_vvm_get_pool(vk_device & device) {
     // Enforce the planner's KV hold from the first allocation: without this,
     // expert tensors can consume the budget the KV needs (the 262K OOM).
     ggml_vvm_reserve_kv(device->vvm_pool.get(), g_vvm_kv_stash, "ggml_vulkan",
-                        (int)device->index);
+                        (int)device->idx);
     return device->vvm_pool.get();
 }
 
