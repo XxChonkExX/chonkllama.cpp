@@ -172,6 +172,24 @@ struct ggml_vvm_kv_hold {
     bool reserved = false;
 };
 
+// Stash the KV budget on every device hold. Skips holds already reserved:
+// the loader runs auto_plan once per model pass (metadata + tensors), and
+// re-stashing would clear `reserved` while the pool still counts the bytes
+// — the next get_pool re-arm then reserves a SECOND time (seen: 12288 MB
+// held for a 6144 MB plan). First plan wins per process; same-model
+// double passes are then harmless no-ops. (Second load of a DIFFERENT
+// model in one process keeps the first KV value — accepted: server
+// restarts per model are the norm, and a stale value only skews the
+// budget, while a double hold leaks it.)
+inline void ggml_vvm_stash_kv(ggml_vvm_kv_hold * holds, size_t n, uint64_t kv_bytes) {
+    for (size_t i = 0; i < n; i++) {
+        if (!holds[i].reserved) {
+            holds[i].bytes = kv_bytes;
+            holds[i].reserved = false;
+        }
+    }
+}
+
 // Reserve the planned KV once per pool (idempotent). Returns true when the
 // hold is in place; false = refused (plan over-committed: callers keep the
 // hold unreserved and the pool budget still protects late KV).
@@ -224,8 +242,10 @@ inline bool ggml_vvm_compute_plan(vvm::DeviceSource source,
 
 // ---------------------------------------------------------------------------
 // Per-tensor pick: resolve a placement decision from a stored plan.
-// Returns {have_plan, want_cpu, device_index}; the caller maps
-// device_index through its own backend buffer-type function. want_cpu covers
+// Thin wrapper over the registry-side vvm::route_plan() (the single choke
+// point — identical semantics by construction, not a copy). Returns
+// {have_plan, want_cpu, device_index}; the caller maps device_index
+// through its own backend buffer-type function. want_cpu covers
 // LookupTable, out-of-range expert layers, and missing dense devices.
 // A tensor outside any plan entry (non-expert, non-LUT on a plan without
 // dense info) resolves to the plan's dense device.
@@ -246,21 +266,8 @@ inline ggml_vvm_pick ggml_vvm_pick_from_plan(const vvm::PlacementPlan & plan,
     out.have_plan = true;
     int32_t layer = -1;
     const vvm::TensorClass cls = vvm::classify_tensor(tensor_name, &layer);
-    if (cls == vvm::TensorClass::LookupTable) {
-        out.want_cpu = true;
-        return out;
-    }
-    if (cls == vvm::TensorClass::Expert) {
-        if (layer < 0 || static_cast<size_t>(layer) >= plan.experts.size()) {
-            out.want_cpu = true;   // outside the plan: safe direction is CPU
-            return out;
-        }
-        const vvm::ExpertPlacement & ep = plan.experts[static_cast<size_t>(layer)];
-        out.want_cpu = ep.onCpu || ep.deviceIndex < 0;
-        out.device_index = ep.deviceIndex;
-        return out;
-    }
-    out.want_cpu = plan.denseDeviceIndex < 0;
-    out.device_index = plan.denseDeviceIndex;
+    const vvm::PoolRoute r = vvm::route_plan(plan, cls, layer);
+    out.want_cpu = r.wantCpu;
+    out.device_index = r.vendorIndex;
     return out;
 }

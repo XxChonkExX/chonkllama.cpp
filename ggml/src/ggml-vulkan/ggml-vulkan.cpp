@@ -4159,11 +4159,9 @@ void ggml_vulkan_vvm_auto_plan(const char * model_path, uint64_t kv_bytes) {
     // this binary can place tensors on) reach the planner.
     // Stash the KV budget on every device hold BEFORE computing: pools are
     // created lazily and reserve fires per-pool on get_pool; only the plan's
-    // dense device will actually consume its hold.
-    for (size_t i = 0; i < GGML_VK_MAX_DEVICES; i++) {
-        g_vvm_kv_holds[i].bytes = kv_bytes;
-        g_vvm_kv_holds[i].reserved = false;
-    }
+    // dense device will actually consume its hold. stash skips reserved
+    // holds (loader double-pass would otherwise double-hold the budget).
+    ggml_vvm_stash_kv(g_vvm_kv_holds, GGML_VK_MAX_DEVICES, kv_bytes);
     g_vvm_plan_ready = ggml_vvm_compute_plan(
         vvm::DeviceSource::Vulkan, model_path, kv_bytes,
         "ggml_vulkan", g_vvm_plan);
