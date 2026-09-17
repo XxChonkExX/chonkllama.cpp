@@ -2,7 +2,7 @@
 
 #include "ggml-alloc.h"
 #include "ggml-vulkan.h"
-#if defined(VVM_AUTO_PLACEMENT_HIP)
+#if defined(VVM_AUTO_PLACEMENT_HIP) || defined(VVM_AUTO_PLACEMENT_CUDA)
 #include "ggml-cuda.h"
 #endif
 #include "ggml.h"
@@ -584,7 +584,7 @@ llama_model_loader::llama_model_loader(
                     }
                     ggml_vulkan_vvm_auto_plan(fname.c_str(), kvMiB * 1024ull * 1024ull);
                 }
-#elif defined(VVM_AUTO_PLACEMENT_HIP)
+#elif defined(VVM_AUTO_PLACEMENT_HIP) || defined(VVM_AUTO_PLACEMENT_CUDA)
                 if (!fname.empty()) {
                     uint64_t kvMiB = 512;
                     if (const char* ke = getenv("VVM_AUTO_KV_MIB")) {
@@ -1283,8 +1283,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                             // VVM unavailable - fall through to default placement.
                             break;
                         }
-#elif defined(VVM_AUTO_PLACEMENT_HIP)
-                        // Same contract through the HIP backend.
+#elif defined(VVM_AUTO_PLACEMENT_HIP) || defined(VVM_AUTO_PLACEMENT_CUDA)
+                        // Same contract through the HIP/CUDA backend.
                         buft = ggml_hip_vvm_auto_pick_named(tensor_name.c_str(), ggml_nbytes(t_meta));
                         if (buft == nullptr) {
                             break;

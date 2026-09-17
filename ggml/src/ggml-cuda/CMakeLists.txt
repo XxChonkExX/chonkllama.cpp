@@ -253,11 +253,33 @@ if (CUDAToolkit_FOUND)
     endif()
 
     target_compile_options(ggml-cuda PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FLAGS}>")
+
+    # VVM (Chonk Buffer) pool integration for the CUDA backend: link against
+    # an external VulkanVM build (UnifiedMemoryPool over the CUDA memory
+    # backend) and route tensor buffer allocations through it when
+    # GGML_CUDA_VVM_POOL=1 is set at runtime. Mirrors the ggml-hip VVM
+    # integration (same ggml-cuda.cu hook, CUDA branch).
+    option(GGML_CUDA_VVM_POOL "Enable Chonk Buffer (VulkanVM UnifiedMemoryPool over CUDA) integration" OFF)
+    set(VVM_ROOT "" CACHE PATH "Path to VulkanVM repo (containing include/ and a built vulkan_vm.lib)")
+    if (GGML_CUDA_VVM_POOL)
+        if (NOT VVM_ROOT)
+            message(FATAL_ERROR "GGML_CUDA_VVM_POOL requires VVM_ROOT pointing at the VulkanVM repo")
+        endif()
+        find_library(VVM_LIBRARY NAMES vulkan_vm PATHS "${VVM_ROOT}/build_infer" "${VVM_ROOT}/build" REQUIRED)
+        target_include_directories(ggml-cuda PRIVATE "${VVM_ROOT}/include")
+        # VulkanVM's public headers include the Vulkan SDK headers; link the
+        # header-only target (no runtime dependency on a Vulkan loader).
+        find_package(Vulkan QUIET)
+        if (Vulkan_FOUND)
+            target_link_libraries(ggml-cuda PRIVATE Vulkan::Headers)
+        else()
+            message(FATAL_ERROR "GGML_CUDA_VVM_POOL requires the Vulkan SDK headers (VulkanVM public headers include them)")
+        endif()
+        target_link_libraries(ggml-cuda PRIVATE ${VVM_LIBRARY})
+        # PUBLIC so consumers (e.g. llama-server's /vvm/stats endpoint) can gate
+        # on the backend being VVM-capable.
+        target_compile_definitions(ggml-cuda PUBLIC GGML_CUDA_VVM_POOL)
+    endif()
 else()
     message(FATAL_ERROR "CUDA Toolkit not found")
 endif()
-
-# NOTE: under GGML_HIP the backend target is ggml-hip (built from these
-# sources via ggml-hip/CMakeLists.txt), which carries the live VVM wiring.
-# A VVM find/link block used to live in this file but never executed -
-# do not add one here.

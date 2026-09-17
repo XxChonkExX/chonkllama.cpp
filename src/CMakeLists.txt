@@ -65,6 +65,12 @@ endif()
 if(TARGET ggml-hip AND GGML_HIP_VVM_POOL)
     target_compile_definitions(llama PUBLIC VVM_AUTO_PLACEMENT_HIP=1)
 endif()
+# Same contract through the CUDA backend: the loader's =auto overrides
+# resolve via the same ggml_hip_vvm_auto_plan/pick_named symbols compiled
+# into ggml-cuda (built when GGML_CUDA_VVM_POOL is on).
+if(TARGET ggml-cuda AND GGML_CUDA_VVM_POOL)
+    target_compile_definitions(llama PUBLIC VVM_AUTO_PLACEMENT_CUDA=1)
+endif()
 
 set_target_properties(llama PROPERTIES
     VERSION ${LLAMA_VERSION_BASE}

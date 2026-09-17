@@ -12,7 +12,7 @@
 #include "fit.h"
 #include "llama.h"
 #include "ggml-vulkan.h"
-#if defined(GGML_HIP_VVM_POOL)
+#if defined(GGML_HIP_VVM_POOL) || defined(GGML_CUDA_VVM_POOL)
 #include "ggml-cuda.h"
 #endif
 #include "log.h"
@@ -4665,7 +4665,7 @@ void server_routes::init_routes() {
         res->status = 200;
 #if defined(VVM_AUTO_PLACEMENT)
         const char * json = ggml_vulkan_vvm_stats_json();
-#elif defined(GGML_HIP_VVM_POOL)
+#elif defined(GGML_HIP_VVM_POOL) || defined(GGML_CUDA_VVM_POOL)
         const char * json = ggml_hip_vvm_stats_json();
 #else
         const char * json = "[]";

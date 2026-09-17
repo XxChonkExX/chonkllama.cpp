@@ -723,11 +723,20 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
 // cuda buffer
 
+// VVM hook enable, evaluated once: HIP builds use GGML_HIP_VVM_POOL; CUDA
+// builds use GGML_CUDA_VVM_POOL. NOTE upstream defines no GGML_USE_CUDA -
+// CUDA is the default when neither HIP nor MUSA is set - so the CUDA branch
+// is spelled as not-HIP (MUSA builds never define GGML_CUDA_VVM_POOL, so
+// they can never enable this by accident).
+#if (defined(GGML_USE_HIP) && defined(GGML_HIP_VVM_POOL)) || (!defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(GGML_CUDA_VVM_POOL))
+#define GGML_VVM_CUDA_HOOK 1
+#endif
+
 struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     std::string name;
-#if defined(GGML_USE_HIP) && defined(GGML_HIP_VVM_POOL)
+#if defined(GGML_VVM_CUDA_HOOK)
     // Chonk Buffer pool: when set, dev_ptr belongs to a vvm::UnifiedMemoryPool
     // allocation. Keeps the RAII handle alive until the last buffer reference
     // dies; ~UniqueAllocation returns the memory to the pool. The context dtor
@@ -741,7 +750,7 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
-#if defined(GGML_USE_HIP) && defined(GGML_HIP_VVM_POOL)
+#if defined(GGML_VVM_CUDA_HOOK)
         if (vvm_guard) return;   // memory returns to the pool via the guard
 #endif
         CUDA_CHECK(cudaFree(dev_ptr));
@@ -890,14 +899,16 @@ static bool ggml_backend_buft_is_cuda(ggml_backend_buffer_type_t buft) {
     return buft->iface.get_name == ggml_backend_cuda_buffer_type_get_name;
 }
 
-#if defined(GGML_USE_HIP) && defined(GGML_HIP_VVM_POOL)
+#if defined(GGML_VVM_CUDA_HOOK)
 // ============================================================================
-// VVM (Chonk Buffer) pool integration for the HIP path.
+// VVM (Chonk Buffer) pool integration for the HIP/CUDA path (one TU serves
+// both: this file compiles as HIP xor CUDA).
 // Mirrors the ggml-vulkan VVM hook: route device-buffer allocations through a
-// vvm::UnifiedMemoryPool created over the HIP memory backend (mem_backend
-// seam). Enabled at build time (GGML_HIP_VVM_POOL) and runtime
-// (GGML_HIP_VVM_POOL=1). Fail-soft: any pool failure falls back to
-// ggml_cuda_device_malloc (hipMalloc).
+// vvm::UnifiedMemoryPool created over the matching memory backend (HIP or
+// CUDA driver plane via the mem_backend seam). Enabled at build time
+// (GGML_HIP_VVM_POOL / GGML_CUDA_VVM_POOL) and runtime
+// (GGML_HIP_VVM_POOL=1 / GGML_CUDA_VVM_POOL=1). Fail-soft: any pool failure
+// falls back to the native device malloc.
 // ============================================================================
 #include "vulkan_vm/vulkan_vm.hpp"
 #include "ggml-vvm-common.h"
@@ -908,7 +919,9 @@ static bool ggml_backend_buft_is_cuda(ggml_backend_buffer_type_t buft) {
 static bool ggml_hip_vvm_enabled() {
     static int enabled = -1;
     if (enabled == -1) {
-        enabled = ggml_vvm_env_on("GGML_HIP_VVM_POOL") ? 1 : 0;
+        // Either runtime env arms the shared hook (one TU is HIP xor CUDA).
+        enabled = (ggml_vvm_env_on("GGML_HIP_VVM_POOL") ||
+                   ggml_vvm_env_on("GGML_CUDA_VVM_POOL")) ? 1 : 0;
     }
     return enabled == 1;
 }
@@ -957,6 +970,11 @@ static vvm::UnifiedMemoryPool * ggml_hip_vvm_get_pool(int device) {
 
     vvm::DeviceConfig cfg;
     cfg.backendDeviceIndex = device;
+#if !defined(GGML_USE_HIP)
+    // CUDA build: route the pool through the CUDA memory backend
+    // (nvcuda driver plane). HIP builds leave Auto (falls to Hip).
+    cfg.memBackendKind = static_cast<int32_t>(vvm::MemBackendKind::Cuda);
+#endif
 
     vvm::PoolConfig pcfg;
     // Shared pool policy (env knobs, chunk ladder, budget): see
@@ -967,11 +985,11 @@ static vvm::UnifiedMemoryPool * ggml_hip_vvm_get_pool(int device) {
 
     auto created = vvm::UnifiedMemoryPool::create(cfg, pcfg);
     if (!created.has_value()) {
-        GGML_LOG_ERROR("ggml_cuda: failed to create VVM (Chonk Buffer) pool for HIP device %d\n", device);
+        GGML_LOG_ERROR("ggml_cuda: failed to create VVM (Chonk Buffer) pool for device %d\n", device);
         entry.create_failed = true;
         return nullptr;
     }
-    GGML_LOG_INFO("ggml_cuda: VVM Chonk Buffer pool created for HIP device %d\n", device);
+    GGML_LOG_INFO("ggml_cuda: VVM Chonk Buffer pool created for device %d\n", device);
     entry.pool = std::make_unique<vvm::UnifiedMemoryPool>(std::move(*created));
     // Enforce the planner's KV hold from the first allocation: without this,
     // expert tensors can consume the budget the KV needs (the 262K OOM).
@@ -985,14 +1003,14 @@ static vvm::UnifiedMemoryPool * ggml_hip_vvm_get_pool(int device) {
 // (Planner state lives with the pool entries above so get_pool's re-arm
 // paths can read it.)
 void ggml_hip_vvm_auto_plan(const char * model_path, uint64_t kv_bytes) {
-#if defined(GGML_USE_HIP) && defined(GGML_HIP_VVM_POOL)
+#if defined(GGML_VVM_CUDA_HOOK)
     std::lock_guard<std::mutex> lock(g_hip_vvm_mtx);
     g_hip_vvm_plan_ready = false;
     if (!ggml_hip_vvm_enabled()) {
         return;
     }
-    // Consumer filter lives inside: only HIP-source devices (the cards this
-    // binary can place tensors on) reach the planner.
+    // Consumer filter lives inside: only devices from this binary's runtime
+    // (HIP- or CUDA-source) reach the planner.
     // Stash the KV budget for per-device holds BEFORE computing: pools are
     // created lazily and reserve fires in get_pool. Stash skips reserved
     // holds (loader double-pass would otherwise double-hold the budget).
@@ -1002,9 +1020,15 @@ void ggml_hip_vvm_auto_plan(const char * model_path, uint64_t kv_bytes) {
     for (int d = 0; d < GGML_CUDA_MAX_DEVICES; d++) {
         g_hip_vvm_pools[d].create_failed = false;
     }
+#if !defined(GGML_USE_HIP)
+    g_hip_vvm_plan_ready = ggml_vvm_compute_plan(
+        vvm::DeviceSource::Cuda, model_path, kv_bytes,
+        "ggml_cuda", g_hip_vvm_plan);
+#else
     g_hip_vvm_plan_ready = ggml_vvm_compute_plan(
         vvm::DeviceSource::Hip, model_path, kv_bytes,
         "ggml_cuda", g_hip_vvm_plan);
+#endif
 #else
     (void)model_path;
     (void)kv_bytes;
@@ -1012,7 +1036,7 @@ void ggml_hip_vvm_auto_plan(const char * model_path, uint64_t kv_bytes) {
 }
 
 ggml_backend_buffer_type_t ggml_hip_vvm_auto_pick_named(const char * tensor_name, size_t nbytes) {
-#if defined(GGML_USE_HIP) && defined(GGML_HIP_VVM_POOL)
+#if defined(GGML_VVM_CUDA_HOOK)
     if (!ggml_hip_vvm_enabled()) {
         return nullptr;
     }
@@ -1045,7 +1069,7 @@ ggml_backend_buffer_type_t ggml_hip_vvm_auto_pick_named(const char * tensor_name
 // Chonk Buffer pool statistics for HIP: same JSON schema as
 // ggml_vulkan_vvm_stats_json (per-device pool state for /vvm/stats).
 const char * ggml_hip_vvm_stats_json(void) {
-#if defined(GGML_USE_HIP) && defined(GGML_HIP_VVM_POOL)
+#if defined(GGML_VVM_CUDA_HOOK)
     // thread_local: see ggml_vulkan_vvm_stats_json - concurrent requests
     // must not observe each other's rebuild.
     thread_local std::string json;
@@ -1073,14 +1097,14 @@ const char * ggml_hip_vvm_stats_json(void) {
     return "[]";
 #endif
 }
-#endif  // GGML_USE_HIP && GGML_HIP_VVM_POOL
+#endif  // VVM pool hook (HIP or CUDA backend)
 
 static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
 
     ggml_cuda_set_device(buft_ctx->device);
 
-#if defined(GGML_USE_HIP) && defined(GGML_HIP_VVM_POOL)
+#if defined(GGML_VVM_CUDA_HOOK)
     if (ggml_hip_vvm_enabled()) {
         try {
             vvm::UnifiedMemoryPool * pool = ggml_hip_vvm_get_pool(buft_ctx->device);
@@ -1108,7 +1132,11 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
                 }
             }
         } catch (const std::exception & e) {
+#if !defined(GGML_USE_HIP)
+            GGML_LOG_WARN("ggml_cuda: VVM pool alloc failed for %zu bytes (%s); falling back to cudaMalloc\n", size, e.what());
+#else
             GGML_LOG_WARN("ggml_cuda: VVM pool alloc failed for %zu bytes (%s); falling back to hipMalloc\n", size, e.what());
+#endif
         }
     }
 #endif
