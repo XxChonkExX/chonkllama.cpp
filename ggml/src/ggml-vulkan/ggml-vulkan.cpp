@@ -17329,10 +17329,10 @@ static ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backe
             dev_buffer = ggml_vk_create_buffer_device(ctx->device, size);
         }
     } catch (const vk::SystemError& e) {
-        fprintf(stderr, "ggml_vulkan: buffer alloc failed (%zu bytes): %s\n", size, e.what());
+        GGML_LOG_ERROR("ggml_vulkan: buffer alloc failed (%zu bytes): %s\n", size, e.what());
         return nullptr;
     } catch (const std::runtime_error& e) {
-        fprintf(stderr, "ggml_vulkan: buffer alloc failed (%zu bytes): %s\n", size, e.what());
+        GGML_LOG_ERROR("ggml_vulkan: buffer alloc failed (%zu bytes): %s\n", size, e.what());
         return nullptr;
     }
 

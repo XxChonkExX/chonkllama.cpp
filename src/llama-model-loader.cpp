@@ -572,9 +572,8 @@ llama_model_loader::llama_model_loader(
             if (p->buft == nullptr) {
 #if defined(VVM_AUTO_PLACEMENT)
                 ggml_vulkan_vvm_auto_begin();
-                // 512 MiB KV headroom matches the auto-budget headroom
-                // philosophy; the plan reserves it on the dense device.
-                // (A --vvm-auto-kv-mib flag can thread the real -c later.)
+                // 512 MiB default KV headroom (override via --vvm-auto-kv-mib,
+                // handled by the planner at pool-create time).
                 if (!fname.empty()) {
                     // Real KV budget: VVM_AUTO_KV_MIB (MiB) or the 512 MiB
                     // placeholder for small contexts.
