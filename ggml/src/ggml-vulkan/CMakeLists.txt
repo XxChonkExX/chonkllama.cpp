@@ -196,6 +196,13 @@ if (Vulkan_FOUND)
         CMAKE_ARGS -DCMAKE_INSTALL_PREFIX=${CMAKE_BINARY_DIR}/$<CONFIG>
                    -DCMAKE_INSTALL_BINDIR=.
                    -DCMAKE_BUILD_TYPE=$<CONFIG>
+                   # Toolchain-less hosts (no WinSDK rc.exe on PATH): skip
+                   # the ABI try-compile and skip manifests (found 2026-09
+                   # on a BuildTools-only box; the parent flags do not
+                   # reach this nested configure).
+                   -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY
+                   -DCMAKE_EXE_LINKER_FLAGS=/MANIFEST:NO
+                   -DCMAKE_SHARED_LINKER_FLAGS=/MANIFEST:NO
                    ${VULKAN_SHADER_GEN_CMAKE_ARGS}
 
         BUILD_COMMAND ${CMAKE_COMMAND} --build . --config $<CONFIG>
