@@ -50,9 +50,13 @@ add_library(llama
             ${LLAMA_MODELS_SOURCES}
             )
 
-# VVM auto-placement calls resolve to symbols in ggml-vulkan; gate them out
-# when that backend is not part of the build (e.g. HIP-only builds).
-if(TARGET ggml-vulkan)
+# VVM auto-placement calls resolve to symbols in ggml-vulkan; gate them on
+# the pool option itself, not mere target existence (a Vulkan-capable build
+# with GGML_VK_VVM_POOL=OFF must not take the VVM branch).
+# Priority note: when BOTH pool options are on, the loader prefers the
+# Vulkan planner (#if VVM_AUTO_PLACEMENT first). Runtime fallback across
+# backends is future work - see ggml-vvm-common.h.
+if(TARGET ggml-vulkan AND GGML_VK_VVM_POOL)
     target_compile_definitions(llama PUBLIC VVM_AUTO_PLACEMENT=1)
 endif()
 # Same contract through the HIP backend: the loader's =auto overrides
