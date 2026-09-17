@@ -915,15 +915,43 @@ static bool ggml_hip_vvm_enabled() {
 
 struct ggml_hip_vvm_entry {
     std::unique_ptr<vvm::UnifiedMemoryPool> pool;
-    ggml_vvm_kv_hold kv;   // planned KV budget, reserved at pool create
+    // Negative cache: a failed create is not retried for the rest of this
+    // load (each retry costs a full create attempt + an error log per
+    // tensor). Cleared by auto_plan at the next load.
+    bool create_failed = false;
 };
 static std::mutex g_hip_vvm_mtx;
 static ggml_hip_vvm_entry g_hip_vvm_pools[GGML_CUDA_MAX_DEVICES];
+// Planned KV budget (per-device holds): set at auto-plan time, enforced on
+// every get_pool hit (ggml_vvm_reserve_kv is idempotent). Mirrors the Vulkan
+// g_vvm_kv_holds[]: only the plan's dense device consumes its hold.
+static ggml_vvm_kv_hold g_hip_vvm_kv_holds[GGML_CUDA_MAX_DEVICES];
+// Planner state: one PlacementPlan per model load, resolved per tensor name.
+// Declared here (ahead of get_pool) because the KV-hold re-arm paths in
+// get_pool read the ready flag and dense index.
+static vvm::PlacementPlan g_hip_vvm_plan;
+static bool g_hip_vvm_plan_ready = false;
 
 static vvm::UnifiedMemoryPool * ggml_hip_vvm_get_pool(int device) {
     std::lock_guard<std::mutex> lock(g_hip_vvm_mtx);
+    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
+        return nullptr;
+    }
     auto & entry = g_hip_vvm_pools[device];
+    // Negative cache: a failed create is not retried for the rest of this
+    // load (each retry costs a full create attempt + an error log per
+    // tensor). Cleared by auto_plan at the next load.
+    if (entry.create_failed) {
+        return nullptr;
+    }
     if (entry.pool) {
+        // Re-arm the KV hold on every hit (idempotent): a second model load
+        // must not inherit the first load's consumed reservation. Only the
+        // plan's dense device consumes its hold; other devices keep their
+        // full heap for experts.
+        if (g_hip_vvm_plan_ready && device == g_hip_vvm_plan.denseDeviceIndex) {
+            ggml_vvm_reserve_kv(entry.pool.get(), g_hip_vvm_kv_holds[device], "ggml_cuda", device);
+        }
         return entry.pool.get();
     }
 
@@ -940,21 +968,22 @@ static vvm::UnifiedMemoryPool * ggml_hip_vvm_get_pool(int device) {
     auto created = vvm::UnifiedMemoryPool::create(cfg, pcfg);
     if (!created.has_value()) {
         GGML_LOG_ERROR("ggml_cuda: failed to create VVM (Chonk Buffer) pool for HIP device %d\n", device);
+        entry.create_failed = true;
         return nullptr;
     }
     GGML_LOG_INFO("ggml_cuda: VVM Chonk Buffer pool created for HIP device %d\n", device);
     entry.pool = std::make_unique<vvm::UnifiedMemoryPool>(std::move(*created));
     // Enforce the planner's KV hold from the first allocation: without this,
     // expert tensors can consume the budget the KV needs (the 262K OOM).
-    ggml_vvm_reserve_kv(entry.pool.get(), entry.kv, "ggml_cuda", device);
+    // Dense device only (see get_pool early-return path).
+    if (g_hip_vvm_plan_ready && device == g_hip_vvm_plan.denseDeviceIndex) {
+        ggml_vvm_reserve_kv(entry.pool.get(), g_hip_vvm_kv_holds[device], "ggml_cuda", device);
+    }
     return entry.pool.get();
 }
 
-// Planner state: one PlacementPlan per model load, resolved per tensor name.
-// The pool mutex serializes the snapshot; buffer types resolve after.
-static vvm::PlacementPlan g_hip_vvm_plan;
-static bool g_hip_vvm_plan_ready = false;
-
+// (Planner state lives with the pool entries above so get_pool's re-arm
+// paths can read it.)
 void ggml_hip_vvm_auto_plan(const char * model_path, uint64_t kv_bytes) {
 #if defined(GGML_USE_HIP) && defined(GGML_HIP_VVM_POOL)
     std::lock_guard<std::mutex> lock(g_hip_vvm_mtx);
@@ -965,10 +994,12 @@ void ggml_hip_vvm_auto_plan(const char * model_path, uint64_t kv_bytes) {
     // Consumer filter lives inside: only HIP-source devices (the cards this
     // binary can place tensors on) reach the planner.
     // Stash the KV budget for per-device holds BEFORE computing: pools are
-    // created lazily and reserve fires in get_pool.
+    // created lazily and reserve fires in get_pool. Also clear the create
+    // negative cache: a new load retries previously failed devices.
     for (int d = 0; d < GGML_CUDA_MAX_DEVICES; d++) {
-        g_hip_vvm_pools[d].kv.bytes = kv_bytes;
-        g_hip_vvm_pools[d].kv.reserved = false;
+        g_hip_vvm_kv_holds[d].bytes = kv_bytes;
+        g_hip_vvm_kv_holds[d].reserved = false;
+        g_hip_vvm_pools[d].create_failed = false;
     }
     g_hip_vvm_plan_ready = ggml_vvm_compute_plan(
         vvm::DeviceSource::Hip, model_path, kv_bytes,
@@ -1014,12 +1045,14 @@ ggml_backend_buffer_type_t ggml_hip_vvm_auto_pick_named(const char * tensor_name
 // ggml_vulkan_vvm_stats_json (per-device pool state for /vvm/stats).
 const char * ggml_hip_vvm_stats_json(void) {
 #if defined(GGML_USE_HIP) && defined(GGML_HIP_VVM_POOL)
-    static std::string json;
+    // thread_local: see ggml_vulkan_vvm_stats_json - concurrent requests
+    // must not observe each other's rebuild.
+    thread_local std::string json;
+    std::lock_guard<std::mutex> lock(g_hip_vvm_mtx);
     json = "[]";
     if (!ggml_hip_vvm_enabled()) {
         return json.c_str();
     }
-    std::lock_guard<std::mutex> lock(g_hip_vvm_mtx);
     json = "[";
     bool first = true;
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; i++) {
@@ -1059,11 +1092,14 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
                 desc.memoryUsage = vvm::MemoryUsage::GpuOnly;
                 auto alloc = pool->allocate(desc);
                 if (alloc.has_value()) {
-                    // HIP backend: the device pointer IS the buffer.
-                    void * dev_ptr = reinterpret_cast<void *>(alloc->buffer);
+                    // Take RAII ownership FIRST (see the Vulkan hook): any
+                    // throw below unwinds through ~UniqueAllocation instead
+                    // of leaking the sub-allocation. HIP backend: the device
+                    // pointer IS the buffer.
                     struct vvm_guard_obj { vvm::UniqueAllocation a; };
                     auto guard = std::make_shared<vvm_guard_obj>(
                         vvm_guard_obj{ vvm::UniqueAllocation::make(pool, std::move(*alloc)) });
+                    void * dev_ptr = reinterpret_cast<void *>(guard->a->buffer);
                     ggml_backend_cuda_buffer_context * ctx =
                         new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
                     ctx->vvm_guard = std::static_pointer_cast<void>(guard);

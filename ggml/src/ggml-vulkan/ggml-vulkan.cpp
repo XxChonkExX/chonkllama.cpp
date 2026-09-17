@@ -3841,10 +3841,17 @@ static vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size);
 // pool via the device struct under this lock too).
 static std::mutex g_vvm_pools_mtx;
 
-// Planned KV budget (stash): set at auto-plan time, consumed at pool create
-// (ggml_vvm_reserve_kv). One hold for the process's Vulkan devices: all
-// Vulkan pools share the same planned KV reserve.
-static ggml_vvm_kv_hold g_vvm_kv_stash;
+// Planned KV budget (per-device holds): set at auto-plan time, enforced on
+// every get_pool hit (ggml_vvm_reserve_kv is idempotent). One hold per
+// device; only the plan's dense device actually reserves, so a second model
+// load re-arms all holds instead of inheriting the first load's state.
+static ggml_vvm_kv_hold g_vvm_kv_holds[GGML_VK_MAX_DEVICES];
+
+// Planner state: one PlacementPlan per model load, resolved per tensor name.
+// Declared here (ahead of get_pool) because the KV-hold re-arm paths in
+// get_pool read the ready flag and dense index.
+static vvm::PlacementPlan g_vvm_plan;
+static bool g_vvm_plan_ready = false;
 
 // Auto-split placement state (--vvm-split pattern=auto): per-device remaining
 // byte budgets, snapshotted from free VRAM at load start and consumed as
@@ -3871,6 +3878,14 @@ static vvm::UnifiedMemoryPool * ggml_vk_vvm_get_pool(vk_device & device) {
     // Pool lives on the device struct (shared_ptr, process lifetime): no map,
     // no key-miss on fresh VkDevice handles, no static-storage lifetime traps.
     if (device->vvm_pool) {
+        // Re-arm the KV hold on every hit (idempotent): a second model load
+        // must not inherit the first load's consumed reservation, and a pool
+        // created before its plan existed still needs the hold enforced.
+        if (g_vvm_plan_ready && (int)device->idx == g_vvm_plan.denseDeviceIndex &&
+            device->idx < GGML_VK_MAX_DEVICES) {
+            ggml_vvm_reserve_kv(device->vvm_pool.get(), g_vvm_kv_holds[device->idx],
+                                "ggml_vulkan", (int)device->idx);
+        }
         return device->vvm_pool.get();
     }
 
@@ -3918,8 +3933,13 @@ static vvm::UnifiedMemoryPool * ggml_vk_vvm_get_pool(vk_device & device) {
     device->vvm_pool = std::make_unique<vvm::UnifiedMemoryPool>(std::move(*created));
     // Enforce the planner's KV hold from the first allocation: without this,
     // expert tensors can consume the budget the KV needs (the 262K OOM).
-    ggml_vvm_reserve_kv(device->vvm_pool.get(), g_vvm_kv_stash, "ggml_vulkan",
-                        (int)device->idx);
+    // Only the plan's dense device consumes its hold; other devices keep
+    // their full heap for experts.
+    if (g_vvm_plan_ready && (int)device->idx == g_vvm_plan.denseDeviceIndex &&
+        device->idx < GGML_VK_MAX_DEVICES) {
+        ggml_vvm_reserve_kv(device->vvm_pool.get(), g_vvm_kv_holds[device->idx],
+                            "ggml_vulkan", (int)device->idx);
+    }
     return device->vvm_pool.get();
 }
 
@@ -3948,8 +3968,20 @@ static vk_buffer ggml_vk_vvm_create_buffer(vk_device & device, size_t size) {
         throw std::runtime_error("ggml_vulkan: VVM pool allocation failed for " + std::to_string(size) + " bytes");
     }
 
-    vk_buffer_struct * raw = new vk_buffer_struct();
-    raw->buffer = alloc->buffer;
+    // Take RAII ownership FIRST: from here on, any throw (make_shared,
+    // getBufferAddress, struct fill) unwinds through ~UniqueAllocation and
+    // returns the memory to the pool. Previously the window between
+    // allocate() and guard construction leaked the sub-allocation, and a
+    // throw from getBufferAddress() leaked the raw struct.
+    struct vvm_alloc_guard {
+        vvm::UniqueAllocation alloc;
+    };
+    auto guard = std::make_shared<vvm_alloc_guard>(
+        vvm_alloc_guard{ vvm::UniqueAllocation::make(pool, std::move(*alloc)) });
+    const vvm::Allocation * pa = guard->alloc.get();
+
+    auto raw = std::make_unique<vk_buffer_struct>();
+    raw->buffer = pa->buffer;
     raw->memory_property_flags = vk::MemoryPropertyFlagBits::eDeviceLocal;
     raw->ptr = nullptr;
     raw->size = size;
@@ -3961,13 +3993,7 @@ static vk_buffer ggml_vk_vvm_create_buffer(vk_device & device, size_t size) {
 
     // Guard keeps the RAII allocation handle alive until the last buffer
     // reference dies; ~UniqueAllocation returns the memory to the pool.
-    struct vvm_alloc_guard {
-        vvm::UniqueAllocation alloc;
-    };
-    auto guard = std::make_shared<vvm_alloc_guard>(
-        vvm_alloc_guard{ vvm::UniqueAllocation::make(pool, std::move(*alloc)) });
-
-    return vk_buffer(raw, [guard](vk_buffer_struct * p) {
+    return vk_buffer(raw.release(), [guard](vk_buffer_struct * p) {
         delete p;
     });
 }
@@ -4023,12 +4049,16 @@ vk_device_struct::~vk_device_struct() {
 
 const char * ggml_vulkan_vvm_stats_json(void) {
 #if defined(GGML_VK_VVM_POOL)
-    static std::string json;
+    // thread_local: concurrent /vvm/stats requests on different server
+    // threads each get their own buffer, so no caller can observe another
+    // request's rebuild mid-copy. All mutation still happens under the
+    // pool mutex.
+    thread_local std::string json;
+    std::lock_guard<std::mutex> lock(g_vvm_pools_mtx);
     json = "[]";
     if (!ggml_vk_vvm_enabled()) {
         return json.c_str();
     }
-    std::lock_guard<std::mutex> lock(g_vvm_pools_mtx);
     json = "[";
     bool first = true;
     for (size_t i = 0; i < GGML_VK_MAX_DEVICES; i++) {
@@ -4116,11 +4146,8 @@ ggml_backend_buffer_type_t ggml_vulkan_vvm_auto_pick(size_t nbytes) {
 #endif
 }
 
-// Planner state: one PlacementPlan per model load, resolved per tensor name.
-// Guarded by g_vvm_pools_mtx (already held on this path only at begin).
-static vvm::PlacementPlan g_vvm_plan;
-static bool g_vvm_plan_ready = false;
-
+// (Planner state lives with the pool entries above so get_pool's re-arm
+// paths can read it.)
 void ggml_vulkan_vvm_auto_plan(const char * model_path, uint64_t kv_bytes) {
 #if defined(GGML_VK_VVM_POOL)
     std::lock_guard<std::mutex> lock(g_vvm_pools_mtx);
@@ -4130,10 +4157,13 @@ void ggml_vulkan_vvm_auto_plan(const char * model_path, uint64_t kv_bytes) {
     }
     // Consumer filter lives inside: only Vulkan-source devices (the cards
     // this binary can place tensors on) reach the planner.
-    // Stash the KV budget BEFORE computing: pools are created lazily and
-    // reserve fires at pool create.
-    g_vvm_kv_stash.bytes = kv_bytes;
-    g_vvm_kv_stash.reserved = false;
+    // Stash the KV budget on every device hold BEFORE computing: pools are
+    // created lazily and reserve fires per-pool on get_pool; only the plan's
+    // dense device will actually consume its hold.
+    for (size_t i = 0; i < GGML_VK_MAX_DEVICES; i++) {
+        g_vvm_kv_holds[i].bytes = kv_bytes;
+        g_vvm_kv_holds[i].reserved = false;
+    }
     g_vvm_plan_ready = ggml_vvm_compute_plan(
         vvm::DeviceSource::Vulkan, model_path, kv_bytes,
         "ggml_vulkan", g_vvm_plan);
@@ -17352,8 +17382,9 @@ static size_t ggml_backend_vk_buffer_type_get_max_size(ggml_backend_buffer_type_
     // Chonk Buffer: cap reported max allocation size at the pool block size so
     // ggml's allocators split their reservations into chunks that sub-allocate
     // from Chonk blocks instead of falling into per-buffer dedicated memory.
+    // Reads the same GGML_VVM_BLOCK_SIZE knob as pool creation (shared helper).
     if (ggml_vk_vvm_enabled()) {
-        return 1ull * 1024ull * 1024ull * 1024ull;  // == VVM pool blockSize
+        return (size_t)ggml_vvm_block_size_bytes();
     }
 #endif
     return ctx->device->suballocation_block_size;
