@@ -49,6 +49,23 @@ inline bool ggml_vvm_env_on(const char * env_name) {
 // - PURE DEVICE_LOCAL default: ReBAR-mapped VRAM lost ~3x decode on Arc.
 // ---------------------------------------------------------------------------
 
+// Effective pool block size shared with get_max_size caps: the configured
+// GGML_VVM_BLOCK_SIZE when valid, else the 1 GiB default. Parsed once per
+// process (env is read at startup); matches ggml_vvm_default_pool_config.
+inline uint64_t ggml_vvm_block_size_bytes() {
+    static uint64_t cached = 0;
+    if (cached == 0) {
+        cached = 1ull * 1024ull * 1024ull * 1024ull;
+        if (const char * bs = getenv("GGML_VVM_BLOCK_SIZE")) {
+            unsigned long long v = strtoull(bs, nullptr, 0);
+            if (v >= 256ull * 1024ull && v <= 8ull * 1024ull * 1024ull * 1024ull) {
+                cached = v;
+            }
+        }
+    }
+    return cached;
+}
+
 inline void ggml_vvm_default_pool_config(vvm::PoolConfig & pcfg,
                                          bool enable_device_address,
                                          float memory_priority,
