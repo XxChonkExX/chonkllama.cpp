@@ -1294,10 +1294,12 @@ struct vk_buffer_struct {
     vk_device device;
 
     // VVM (Chonk Buffer) integration: when true, this buffer's memory is owned
-    // by an external vvm::UnifiedMemoryPool sub-allocation. The raw Vulkan
-    // objects must NOT be destroyed here - ownership returns to the pool via
-    // the shared_ptr deleter installed at creation time.
-    bool external_memory = false;
+    // by a vvm::UnifiedMemoryPool sub-allocation. The raw Vulkan objects must
+    // NOT be destroyed here - ownership returns to the pool via the shared_ptr
+    // deleter installed at creation time. Named vvm_owned (not external_memory)
+    // so a future upstream rebase adding its own external-memory semantics
+    // cannot collide with this flag.
+    bool vvm_owned = false;
 
     ~vk_buffer_struct() {
         if (size == 0) {
@@ -1305,7 +1307,7 @@ struct vk_buffer_struct {
         }
         VK_LOG_DEBUG("~vk_buffer_struct(" << buffer << ", " << size << ")");
 
-        if (external_memory) {
+        if (vvm_owned) {
             return;
         }
         device->device.freeMemory(device_memory);
@@ -3989,7 +3991,7 @@ static vk_buffer ggml_vk_vvm_create_buffer(vk_device & device, size_t size) {
     if (device->buffer_device_address) {
         raw->bda_addr = device->device.getBufferAddress({ raw->buffer });
     }
-    raw->external_memory = true;
+    raw->vvm_owned = true;
 
     // Guard keeps the RAII allocation handle alive until the last buffer
     // reference dies; ~UniqueAllocation returns the memory to the pool.
