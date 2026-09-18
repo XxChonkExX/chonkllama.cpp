@@ -4663,7 +4663,28 @@ void server_routes::init_routes() {
         auto res = create_response(true);
         res->content_type = "application/json";
         res->status = 200;
-#if defined(VVM_AUTO_PLACEMENT)
+#if defined(VVM_AUTO_PLACEMENT) && (defined(GGML_HIP_VVM_POOL) || defined(GGML_CUDA_VVM_POOL))
+        // Combined Vulkan+CUDA build: merge both backends' pool arrays.
+        // Each getter returns its own thread_local buffer; copy before
+        // building the merged array. Schema is shared, so a plain
+        // concatenation is a valid list.
+        thread_local std::string merged;
+        merged = "[";
+        bool first = true;
+        for (const char * part : { ggml_vulkan_vvm_stats_json(), ggml_hip_vvm_stats_json() }) {
+            const std::string s = part;
+            if (s.size() <= 2) { // "[]" - no pools on this backend
+                continue;
+            }
+            if (!first) {
+                merged += ",";
+            }
+            merged += s.substr(1, s.size() - 2);
+            first = false;
+        }
+        merged += "]";
+        const char * json = merged.c_str();
+#elif defined(VVM_AUTO_PLACEMENT)
         const char * json = ggml_vulkan_vvm_stats_json();
 #elif defined(GGML_HIP_VVM_POOL) || defined(GGML_CUDA_VVM_POOL)
         const char * json = ggml_hip_vvm_stats_json();
