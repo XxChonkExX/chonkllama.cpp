@@ -58,7 +58,8 @@ inline uint64_t ggml_vvm_block_size_bytes() {
         cached = 1ull * 1024ull * 1024ull * 1024ull;
         if (const char * bs = getenv("GGML_VVM_BLOCK_SIZE")) {
             unsigned long long v = strtoull(bs, nullptr, 0);
-            if (v >= 256ull * 1024ull && v <= 8ull * 1024ull * 1024ull * 1024ull) {
+            if (v >= 256ull * 1024ull && v <= 8ull * 1024ull * 1024ull * 1024ull &&
+                (v & (v - 1)) == 0) {
                 cached = v;
             }
         }
@@ -87,10 +88,11 @@ inline void ggml_vvm_default_pool_config(vvm::PoolConfig & pcfg,
 
     if (const char * bs = getenv("GGML_VVM_BLOCK_SIZE")) {
         unsigned long long v = strtoull(bs, nullptr, 0);
-        if (v >= 256ull * 1024ull && v <= 8ull * 1024ull * 1024ull * 1024ull) {
+        if (v >= 256ull * 1024ull && v <= 8ull * 1024ull * 1024ull * 1024ull &&
+            (v & (v - 1)) == 0) {
             pcfg.blockSize = v;
         } else if (v != 0) {
-            GGML_LOG_WARN("%s: ignoring out-of-range GGML_VVM_BLOCK_SIZE=%llu (256 KiB..8 GiB)\n",
+            GGML_LOG_WARN("%s: ignoring non-power-of-two or out-of-range GGML_VVM_BLOCK_SIZE=%llu (pow2, 256 KiB..8 GiB)\n",
                           log_tag, v);
         }
     }
@@ -98,6 +100,8 @@ inline void ggml_vvm_default_pool_config(vvm::PoolConfig & pcfg,
     if (const char * pl = getenv("GGML_VVM_PURE_LOCAL")) {
         if (pl[0] == '0') {
             pcfg.preferPureDeviceLocal = false;
+            GGML_LOG_INFO("%s: GGML_VVM_PURE_LOCAL=0, ReBAR (host-visible) VRAM types allowed\n",
+                          log_tag);
         }
     }
     if (const char * nd = getenv("GGML_VVM_NO_DEDICATED")) {

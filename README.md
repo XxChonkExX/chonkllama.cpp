@@ -9,14 +9,21 @@
 > **auto-placement planner** (`--vvm-split ...=auto`) puts each tensor class
 > where it runs fastest — no hand-tuning `--n-cpu-moe` sweeps.
 >
-> **Measured (single RX 7900 XTX, Qwen3.8-Flash-Next 90 GB): 19.86 t/s decode.**
+> **Measured (single RX 7900 XTX, Qwen3.8-Flash-Next 90 GB): 19.86 t/s decode**
+> (Linux + ROCm reference; Windows + Vulkan measures 16.4-17.4 t/s warm on
+> the same model, host-RAM-bandwidth-bound with all experts on CPU).
 >
 > | Backend | What the integration does |
 > |---|---|
 > | Vulkan (`GGML_VK_VVM_POOL`) | ggml-vulkan tensor buffers via the Chonk pool (`GGML_VK_VVM_POOL=1`) |
 > | HIP (`GGML_HIP_VVM_POOL`) | ggml-hip tensor buffers via a HIP-backed Chonk pool (`GGML_HIP_VVM_POOL=1`) |
+> | CUDA (`GGML_CUDA_VVM_POOL`) | ggml-cuda tensor buffers via the same pool (`GGML_CUDA_VVM_POOL=1`; NVIDIA, sm_61-era cards verified) |
 > | Planner | `--vvm-split 'ffn_.*_exps.=auto,per_layer_token_embd=CPU'` rediscovers optimal MoE placement from the model file |
-> | Knobs | `GGML_VVM_HEAP_FRACTION` (pool VRAM cap), `GGML_VVM_BLOCK_SIZE`, `--vvm-auto-kv-mib` (KV budget for the planner) |
+> | Knobs | `GGML_VVM_HEAP_FRACTION` (pool VRAM cap), `GGML_VVM_BLOCK_SIZE` (pow2, 256 KiB..8 GiB), `--vvm-auto-kv-mib` (KV budget for the planner), `GGML_VVM_PURE_LOCAL=0` (allow ReBAR VRAM types; default pure device-local) |
+>
+> Known limits: `--vvm-auto-kv-mib` reserves per process, not per model - a
+> second load of a *different* model in the same server keeps the first
+> model's KV value (single-model servers unaffected).
 >
 > **Build (Linux + ROCm, verified):**
 > ```bash
